@@ -288,18 +288,23 @@ fn parse_html(base: &Url, body: &str) -> Option<Listing> {
             mtime,
         };
         match by_url.get(entry.url.as_str()) {
-            // Icons can link to the same target; keep the copy with details.
-            Some(&j) if entries[j].mtime.is_none() && entry.mtime.is_some() => entries[j] = entry,
-            Some(_) => {}
+            // Icons can link to the same target: keep the copy with details, and
+            // let any of the links show that the row is worded as a file name.
+            Some(&j) => {
+                evidence.note(j, &entries[j], anchor.text);
+                if entries[j].mtime.is_none() && entry.mtime.is_some() {
+                    entries[j] = entry;
+                }
+            }
             None => {
-                evidence.add(&entry, anchor.text);
+                evidence.note(entries.len(), &entry, anchor.text);
                 by_url.insert(entry.url.to_string(), entries.len());
                 entries.push(entry);
             }
         }
     }
 
-    if detected.is_none() && !evidence.looks_like_listing() {
+    if detected.is_none() && !evidence.looks_like_listing(&entries) {
         return None;
     }
     Some(Listing {
@@ -318,33 +323,36 @@ fn parse_html(base: &Url, body: &str) -> Option<Listing> {
 /// a date next to it.
 #[derive(Default)]
 struct Evidence {
-    entries: usize,
-    /// Entries whose row has a modification date.
-    dated: usize,
-    /// Entries whose link text is the file name (or its truncation, `name..>`).
-    named: usize,
+    /// Per entry, in the order of the entries: whether a link to it has the file
+    /// name as its text (or its truncation, `name..>`).
+    named: Vec<bool>,
 }
 
 impl Evidence {
-    fn add(&mut self, entry: &Entry, link_html: &str) {
-        self.entries += 1;
-        self.dated += usize::from(entry.mtime.is_some());
-        let text = clean_text(link_html);
-        let text = text.trim_end_matches('/');
-        let truncated = text
-            .strip_suffix("..>")
-            .or_else(|| text.strip_suffix("&gt;"))
-            .or_else(|| text.strip_suffix('…'))
-            .filter(|prefix| !prefix.is_empty());
-        let matches = match truncated {
-            Some(prefix) => entry.name.starts_with(prefix.trim_end_matches('.')),
-            None => text == entry.name,
-        };
-        self.named += usize::from(matches);
+    fn note(&mut self, index: usize, entry: &Entry, link_html: &str) {
+        if self.named.len() <= index {
+            self.named.resize(index + 1, false);
+        }
+        self.named[index] |= link_text_is_name(entry, link_html);
     }
 
-    fn looks_like_listing(&self) -> bool {
-        self.dated >= 3 && self.named * 10 >= self.entries * 8
+    fn looks_like_listing(&self, entries: &[Entry]) -> bool {
+        let dated = entries.iter().filter(|e| e.mtime.is_some()).count();
+        let named = self.named.iter().filter(|&&n| n).count();
+        dated >= 3 && named * 10 >= entries.len() * 8
+    }
+}
+
+fn link_text_is_name(entry: &Entry, link_html: &str) -> bool {
+    let text = clean_text(link_html);
+    let text = text.trim_end_matches('/');
+    let truncated = text
+        .strip_suffix("..>")
+        .or_else(|| text.strip_suffix('…'))
+        .filter(|prefix| !prefix.is_empty());
+    match truncated {
+        Some(prefix) => entry.name.starts_with(prefix.trim_end_matches('.')),
+        None => text == entry.name,
     }
 }
 
@@ -880,6 +888,40 @@ mod tests {
                 ("paper.pdf", false, None, None)
             ]
         );
+    }
+
+    #[test]
+    fn icon_links_do_not_hide_an_unannounced_listing() {
+        let base = Url::parse("https://h.example/pub/").unwrap();
+        // Each row: an icon that is itself a link, then the name as a link, then
+        // the date and size. Nothing on the page says "Index of".
+        let page = |names: &[(&str, &str)]| -> String {
+            let mut body = String::from("<html><head><title>Files</title></head><body><table>\n");
+            for (name, text) in names {
+                body.push_str(&format!(
+                    "<tr><td><a href=\"{name}\"><img src=\"/i/file.png\"></a></td>\
+                     <td><a href=\"{name}\">{text}</a></td><td>28-Sep-2026 10:15</td>\
+                     <td>1.5M</td></tr>\n"
+                ));
+            }
+            body + "</table></body></html>"
+        };
+        let listing = parse(
+            &base,
+            None,
+            &page(&[("a.iso", "a.iso"), ("b.iso", "b.iso"), ("c.iso", "c.iso")]),
+        )
+        .expect("the icon links hid the listing");
+        assert_eq!(listing.entries.len(), 3);
+        assert!(listing.entries.iter().all(|e| e.mtime.is_some()));
+        assert!(listing.entries.iter().all(|e| e.size == Some(1_572_864)));
+        // With titles instead of names it is still a blog, icons or not.
+        let blog = page(&[
+            ("post-1.html", "Why I like Rust"),
+            ("post-2.html", "Notes from a trip"),
+            ("post-3.html", "Ten small tips"),
+        ]);
+        assert!(parse(&base, None, &blog).is_none());
     }
 
     #[test]

@@ -515,8 +515,10 @@ Gbit/s.
   and saves its frontier as candidates, and `opendir auto` chains nightly runs.
 - Trust has two levels instead of the tiers in §6.1: sites you added (seeds) are
   trusted; everything else is untrusted and is dropped if it holds too little of value
-  (`src/quality.rs`: 3 big files or 20 useful files, judged early once 100 files are
-  seen, or when the site is finished). Sensitive names are strong (drop the site) or
+  (`src/quality.rs`: 3 big files or 20 useful files, judged when the site is finished;
+  an unfinished site is dropped early only when plainly junk, counting only folders
+  without sub-folders, since an archive's top folders hold README files and its
+  downloads are further down). Sensitive names are strong (drop the site) or
   weak (drop an untrusted site, or just the entry on a trusted one), and include the
   signatures of a compromised server. `opendir clean` re-applies all rules to stored data.
 - Discovery keeps only listings with a sign of a public archive (host and path tokens,

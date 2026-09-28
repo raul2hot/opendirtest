@@ -60,6 +60,8 @@ edit, one folder URL per line:
 lists next to them.
 
 Sites you add are **trusted**: they are never dropped for holding too little (see below).
+If a seed has moved, so that its address redirects to another site, the new address is
+trusted too (up to 3 new addresses per site, so one site cannot fill the queue).
 I could not open most of these addresses from where I wrote them, so a few may not be
 plain listings. After the first run, `opendir sites --status not_listing` and
 `--status unreachable` show which ones did not work; delete those lines.
@@ -104,9 +106,15 @@ Only sites that hold real downloads are kept. A site you did not add is dropped,
 its listings deleted, unless it has at least **3 files of 10 MiB or more**, or at least
 **20 files of a useful kind** (disk images, archives, installers, documents, ebooks,
 audio, video, data files). Web page files (html, php, js, css, jpg, png, ...) do not
-count. The check waits until it has seen enough files: a big archive's top folders hold
-none, so it is not judged until 100 files have been seen or the site is finished.
-Change it with `--min-big`, `--min-useful`, or `--keep-all`.
+count, and a text file counts only if it is at least 100 KiB (a book or a dataset, not a
+readme).
+
+The check is careful with sites that are not finished. A big archive's top folders hold
+README and index files, and its downloads are further down. So a site that is still being
+crawled is judged only on its folders that have no sub-folders, and is dropped only when
+that is plainly junk: at least 100 such files, none of them big, and under 5% of a useful
+kind. Anything closer to the line waits for the verdict when the site is finished.
+Change the limits with `--min-big`, `--min-useful`, or `--keep-all`.
 
 Sites are also dropped when a listing looks like an accidental exposure or a broken-into
 server: `.env` files, SSH keys, password stores, CMS config files, and folders of links to
@@ -196,12 +204,18 @@ crawled.
 If you have a database from an early version, opendir asks you to start a new one:
 delete `opendir.db`, `opendir.db-wal` and `opendir.db-shm`.
 
+A database from just before the quality check is upgraded in place, and opendir says so.
+It cannot know which of its sites you added yourself, so they all count as found by
+discovery, and the check may remove those that hold little. Sites in your `seeds` folder
+are kept. Put any other site you want to keep there, or crawl it once by name with
+`crawl URL`, which marks it as yours before the check runs.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `auto` | The nightly job described above. Options: `--hours` (default 7), `--seeds` (a file or folder, default `seeds`), `--discover-files` (default 10, 0 to skip), `--crawl`, `--db`, and the crawl options below. |
-| `crawl [URL...] [--seeds FILE-OR-FOLDER] [--candidates]` | Crawls the given directory URLs, and with `--candidates` every site waiting in the database (found by discovery, or paused). Options: `--hours` (time limit), `--max-sites`, `--db` (default `opendir.db`). |
+| `crawl [URL...] [--seeds FILE-OR-FOLDER] [--candidates]` | Crawls the given directory URLs, and with `--candidates` every site waiting in the database (found by discovery, or paused). A site paused earlier continues from where it stopped, even when you name it. Options: `--hours` (time limit), `--max-sites`, `--db` (default `opendir.db`). |
 | `discover` | Finds listings in the Common Crawl index. Options: `--crawl` (default `latest`), `--files` (index files this run, default 10), `--parallel` (default 4), `--db`, `--skip`, `--broad`. |
 | `search WORDS...` | Full-text search over file and folder names. Options: `--ext iso,img`, `--min-mb`, `-n 50`, `--unfiltered` (show results the piracy filter hides), `--takedown`, `--optout`. |
 | `sites` | Lists sites with status, files, size and a note. Options: `--status`, `--sort size\|files\|recent\|name`, `-n`. |

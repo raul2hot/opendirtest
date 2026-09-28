@@ -37,8 +37,9 @@ static STRONG_NAMES: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)\.(kdbx|ppk)$",
         r"(?i)^wallet\.dat$",
         // Links to other hosting accounts' CMS config files, left in a web folder
-        // by an intruder: `<account>-Wordpress26.txt`, `<account>-BoxBilling444.txt404`.
-        r"(?i)^[a-z0-9_.-]+-(wordpress|joomla|phpbb\d*|boxbilling|whmcs|vbulletin|drupal|magento|opencart|prestashop|smf|mybb|moodle)\d*\.txt\d*$",
+        // by an intruder: `<account>-Wordpress26.txt404`. Only the `.txt404` form:
+        // `install-wordpress.txt` or `upgrade-drupal8.txt` are ordinary files.
+        r"(?i)^[a-z0-9_.-]+-(wordpress|joomla|phpbb\d*|boxbilling|whmcs|vbulletin|drupal|magento|opencart|prestashop|smf|mybb|moodle)\d*\.txt404$",
     ])
     .unwrap()
 });
@@ -136,6 +137,17 @@ fn decode_text(bytes: &[u8]) -> String {
     } else {
         String::from_utf8_lossy(bytes).into_owned()
     }
+}
+
+/// A host as the database keys it: lower case, without the trailing dot that
+/// makes `example.com.` the same site as `example.com`.
+pub fn canonical_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The canonical host of a URL, if it has one.
+pub fn canonical_host_of(url: &Url) -> Option<String> {
+    url.host_str().map(canonical_host)
 }
 
 /// Turns an opt-out entry into a host name as crawled URLs have it: accepts a
@@ -329,7 +341,7 @@ pub fn has_archive_signal(url: &Url) -> bool {
 
 /// Opt-out list entries are domains; a domain also covers its subdomains.
 pub fn host_opted_out(host: &str, optout: &[String]) -> bool {
-    let host = host.to_ascii_lowercase();
+    let host = canonical_host(host);
     optout.iter().any(|domain| {
         let domain = domain.to_ascii_lowercase();
         host == domain || host.ends_with(&format!(".{domain}"))
@@ -409,7 +421,6 @@ mod tests {
             "daemon-Wordpress26.txt404/",
             "daemon-phpBB3.txt404/",
             "dbus-BoxBilling444.txt404/",
-            "shop-joomla2.txt",
         ] {
             assert_eq!(sensitivity(name), Some(Sensitivity::Strong), "{name}");
         }
@@ -420,6 +431,13 @@ mod tests {
             "wordpress-6.6.zip",
             "wordpress-plugin-1.txt-notes.tar.gz",
             "joomla-cms-5.2.tar.gz",
+            // Ordinary text files on software sites.
+            "install-wordpress.txt",
+            "readme-wordpress.txt",
+            "faq-moodle.txt",
+            "upgrade-drupal8.txt",
+            "changelog-magento2.txt",
+            "release-notes-joomla4.txt",
         ] {
             assert_eq!(sensitivity(name), None, "{name}");
         }

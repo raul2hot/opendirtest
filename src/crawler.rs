@@ -55,6 +55,10 @@ const MAX_CRAWL_DELAY: Duration = Duration::from_secs(60);
 const MAX_SAVED_OVERFLOW: usize = 50_000;
 /// How often the scheduler looks for newly found sites while slots are free.
 const POLL_EVERY: Duration = Duration::from_secs(2);
+/// A site you added that has moved to another host passes its trust on to the
+/// new address. At most this many such addresses per crawl of one site, so a
+/// site that redirects every folder elsewhere cannot fill the queue.
+pub const MAX_MOVED_SEEDS: usize = 3;
 
 pub struct CrawlConfig {
     /// Hosts crawled at the same time.
@@ -187,6 +191,7 @@ pub async fn crawl(
                     robots: HashMap::new(),
                     robots_blocked: None,
                     last_error: None,
+                    moved_seeds: 0,
                 };
                 let urls = site.urls;
                 tasks.spawn(async move {
@@ -216,7 +221,7 @@ fn group_by_host(seeds: Vec<Url>) -> Vec<PendingHost> {
     let mut hosts: Vec<PendingHost> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for seed in seeds {
-        let Some(host) = seed.host_str().map(str::to_ascii_lowercase) else {
+        let Some(host) = filters::canonical_host_of(&seed) else {
             continue;
         };
         let i = *index.entry(host.clone()).or_insert_with(|| {
@@ -360,6 +365,8 @@ struct HostCrawl {
     /// Why robots.txt kept us out, if it did.
     robots_blocked: Option<String>,
     last_error: Option<String>,
+    /// Redirect targets recorded as seeds so far (`MAX_MOVED_SEEDS`).
+    moved_seeds: usize,
 }
 
 /// What to record for a finished host.
@@ -455,7 +462,7 @@ impl HostCrawl {
                 queue.push_front((url, depth));
                 break;
             }
-            let page = match self.fetch_page(url.clone()).await {
+            let page = match self.fetch_page(url.clone(), depth == 0).await {
                 Fetch::Page(page) => page,
                 Fetch::Skipped => {
                     errors_in_a_row = 0;
@@ -506,8 +513,12 @@ impl HostCrawl {
                 });
             }
 
-            for e in listing.entries.iter().filter(|e| !e.is_dir) {
-                counts.add(&e.name, e.size);
+            // Only folders without sub-folders count: the top of a big archive is
+            // README and index files, and its downloads are further down.
+            if !listing.entries.iter().any(|e| e.is_dir) {
+                for e in &listing.entries {
+                    counts.add(&e.name, e.size);
+                }
             }
             if dirs >= quality::PROBE_DIRS
                 && !probed
@@ -627,11 +638,17 @@ impl HostCrawl {
     /// Records directories on other sites for a later crawl, except on local
     /// and private networks, and (unless `broad`) except ones that show no sign
     /// of being a public archive.
-    async fn save_candidates(&self, mut urls: Vec<Url>) {
+    async fn save_candidates(&self, urls: Vec<Url>) {
+        self.save_candidates_as(urls, LINK_SOURCE, true).await;
+    }
+
+    /// Like `save_candidates`, under another source. Without `need_signal` the
+    /// archive-signal test is skipped, for sites you chose.
+    async fn save_candidates_as(&self, mut urls: Vec<Url>, source: &str, need_signal: bool) {
         if !self.cfg.allow_private_links {
             urls.retain(filters::is_public_host);
         }
-        if !self.cfg.broad {
+        if need_signal && !self.cfg.broad {
             urls.retain(filters::has_archive_signal);
         }
         if urls.is_empty() {
@@ -639,14 +656,15 @@ impl HostCrawl {
         }
         let msg = Msg::Candidates {
             urls,
-            source: LINK_SOURCE.to_string(),
+            source: source.to_string(),
         };
         let _ = self.tx.send(msg).await;
     }
 
     /// Fetches one directory page, following same-host redirects by hand so
-    /// that every hop is checked against robots.txt and paced.
-    async fn fetch_page(&mut self, start: Url) -> Fetch {
+    /// that every hop is checked against robots.txt and paced. `top` is true for
+    /// a URL the crawl started from (a seed, or a saved folder to continue from).
+    async fn fetch_page(&mut self, start: Url, top: bool) -> Fetch {
         let mut url = start;
         for _ in 0..=MAX_REDIRECTS {
             match self.robots_check(&url).await {
@@ -665,10 +683,18 @@ impl HostCrawl {
                 let Some(next) = location(&response, &url) else {
                     return Fetch::Skipped;
                 };
-                if next.host_str() != url.host_str() {
+                if filters::canonical_host_of(&next) != filters::canonical_host_of(&url) {
                     // Another site: remember it for later instead of following it.
                     if next.path().ends_with('/') && next.query().is_none() {
-                        self.save_candidates(vec![next]).await;
+                        if self.trusted && top && self.moved_seeds < MAX_MOVED_SEEDS {
+                            // You added this site and it has moved: the new
+                            // address is yours too.
+                            self.moved_seeds += 1;
+                            self.save_candidates_as(vec![next], store::SEED_SOURCE, false)
+                                .await;
+                        } else {
+                            self.save_candidates(vec![next]).await;
+                        }
                     }
                     return Fetch::Skipped;
                 }

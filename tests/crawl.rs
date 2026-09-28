@@ -875,3 +875,189 @@ async fn a_deep_archive_is_not_judged_before_its_files_are_reached() {
     assert_eq!(host_status(&db, "127.0.0.2"), "done");
     assert_eq!(search(&db, "iso", true, vec![]).len(), 3);
 }
+
+// -- Regression tests for the third independent review ------------------------
+
+/// A mirror-like archive: project folders with a README and an index page at the
+/// top, and the disk image one level down.
+fn mirror_like(projects: usize) -> HashMap<String, Route> {
+    let dirs: Vec<String> = (0..projects).map(|i| format!("p{i}/")).collect();
+    let root: Vec<(&str, u64)> = dirs.iter().map(|d| (d.as_str(), 0)).collect();
+    let mut site = vec![("/".to_string(), listing("/", &root))];
+    for i in 0..projects {
+        site.push((
+            format!("/p{i}/"),
+            listing(
+                &format!("/p{i}/"),
+                &[
+                    ("README.txt", 900 + i as u64),
+                    ("index.html", 4_000),
+                    ("releases/", 0),
+                ],
+            ),
+        ));
+        let iso = format!("p{i}-1.0.iso");
+        site.push((
+            format!("/p{i}/releases/"),
+            listing(
+                &format!("/p{i}/releases/"),
+                &[(iso.as_str(), 4_000_000_000)],
+            ),
+        ));
+    }
+    site.into_iter().collect()
+}
+
+fn reason(db: &Path, host: &str) -> String {
+    query_one(
+        db,
+        &format!("SELECT coalesce(reason, '') FROM hosts WHERE host = '{host}'"),
+    )
+}
+
+#[tokio::test]
+async fn an_archive_with_readmes_at_the_top_and_disk_images_below_is_kept() {
+    let server = serve(mirror_like(110)).await;
+    let db = temp_db("mirror");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+
+    run_judged(vec![], &db).await;
+
+    let why = reason(&db, "127.0.0.2");
+    assert_eq!(host_status(&db, "127.0.0.2"), "done", "{why}");
+    let images: i64 = query_one(&db, "SELECT count(*) FROM files WHERE url LIKE '%.iso'");
+    assert_eq!(images, 110);
+}
+
+#[tokio::test]
+async fn an_archive_paused_among_its_top_folders_is_kept_and_continues() {
+    let server = serve(mirror_like(110)).await;
+    let db = temp_db("mirror-paused");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+    let cfg = || CrawlConfig {
+        max_dirs_per_host: 60,
+        quality: Thresholds::default(),
+        ..fast_config()
+    };
+
+    // The first run ends among the project folders: 59 READMEs and index pages
+    // stored, no disk image yet.
+    run_with_pending(vec![], &db, cfg()).await;
+    let why = reason(&db, "127.0.0.2");
+    assert_eq!(host_status(&db, "127.0.0.2"), "paused", "{why}");
+    assert!(!pending_urls(&db).is_empty());
+
+    // Each new run starts by checking what is stored against the rules, like the
+    // real command does, and must not throw the site away either.
+    for _ in 0..8 {
+        if host_status(&db, "127.0.0.2") == "done" {
+            break;
+        }
+        let mut conn = store::open(&db).unwrap();
+        let rules = store::CleanRules {
+            optout: &[],
+            skip: &opendirtest::filters::SkipList::default(),
+            quality: Thresholds::default(),
+        };
+        let report = store::clean(&mut conn, &rules).unwrap();
+        assert!(report.low_value.is_empty(), "{:?}", report.low_value);
+        drop(conn);
+        run_with_pending(vec![], &db, cfg()).await;
+    }
+    assert_eq!(host_status(&db, "127.0.0.2"), "done");
+    let images: i64 = query_one(&db, "SELECT count(*) FROM files WHERE url LIKE '%.iso'");
+    assert_eq!(images, 110);
+}
+
+#[tokio::test]
+async fn a_site_you_add_that_moved_to_another_address_passes_its_trust_on() {
+    // The old address answers with a redirect. The new one is a different host
+    // name and holds a tiny folder that has no sign of being an archive.
+    let new = serve(routes(vec![(
+        "/stuff/",
+        listing("/stuff/", &[("a.txt", 5)]),
+    )]))
+    .await;
+    let destination = format!("{}stuff/", new.as_host("127.0.0.2"));
+    let old = serve(routes(vec![("/", Route::redirect(&destination))])).await;
+    let db = temp_db("moved");
+
+    run_judged(vec![old.base.clone()], &db).await;
+
+    // The new address was crawled in the same run and kept although it is tiny.
+    assert_eq!(host_status(&db, "127.0.0.2"), "done");
+    let trusted: i64 = query_one(&db, "SELECT trusted FROM hosts WHERE host = '127.0.0.2'");
+    assert_eq!(trusted, 1);
+    assert_eq!(search(&db, "a.txt", true, vec![]).len(), 1);
+    assert_eq!(host_status(&db, "127.0.0.1"), "not_listing");
+}
+
+#[tokio::test]
+async fn a_site_you_did_not_add_does_not_pass_trust_on_when_it_redirects() {
+    let new = serve(routes(vec![("/pub/", listing("/pub/", &[("a.txt", 5)]))])).await;
+    let destination = format!("{}pub/", new.as_host("127.0.0.3"));
+    let old = serve(routes(vec![("/", Route::redirect(&destination))])).await;
+    let db = temp_db("moved-untrusted");
+    add_waiting(&db, &[old.as_host("127.0.0.2")]);
+
+    run_judged(vec![], &db).await;
+
+    // Found through a link and looking like an archive, so it is crawled, but it
+    // is judged like any other site.
+    assert_eq!(host_status(&db, "127.0.0.3"), "low_value");
+}
+
+#[tokio::test]
+async fn a_site_you_add_passes_its_trust_to_only_a_few_new_addresses() {
+    // Five URLs of one site, each moved to a different host.
+    let mut targets = Vec::new();
+    let mut moved = HashMap::new();
+    for i in 0..5 {
+        let target = serve(routes(vec![(
+            "/stuff/",
+            listing("/stuff/", &[("a.txt", 5)]),
+        )]))
+        .await;
+        let to = format!("{}stuff/", target.as_host(&format!("127.0.0.{}", 10 + i)));
+        moved.insert(format!("/r{i}/"), Route::redirect(&to));
+        targets.push(target);
+    }
+    let old = serve(moved).await;
+    let seeds: Vec<Url> = (0..5)
+        .map(|i| old.base.join(&format!("r{i}/")).unwrap())
+        .collect();
+    let db = temp_db("moved-many");
+
+    run_judged(seeds, &db).await;
+
+    let kept: i64 = query_one(
+        &db,
+        "SELECT count(*) FROM hosts WHERE host LIKE '127.0.0.1_' AND status = 'done'",
+    );
+    assert_eq!(kept as usize, crawler::MAX_MOVED_SEEDS);
+}
+
+#[tokio::test]
+async fn a_site_you_add_is_kept_even_if_discovery_found_it_first() {
+    let photos: Vec<(String, u64)> = (0..30)
+        .map(|i| (format!("photo-{i}.jpg"), 40_000))
+        .collect();
+    let photos: Vec<(&str, u64)> = photos.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    let mine = serve(routes(vec![("/", listing("/", &photos))])).await;
+    let db = temp_db("seed-after-find");
+    let url = mine.as_host("127.0.0.2");
+    // Found by Common Crawl on an earlier night; tonight `auto` adds your seeds first.
+    let conn = store::open(&db).unwrap();
+    store::add_candidates(
+        &conn,
+        std::slice::from_ref(&url),
+        "commoncrawl:CC-MAIN-2026-30",
+    )
+    .unwrap();
+    store::add_seeds(&conn, &[url]).unwrap();
+    drop(conn);
+
+    run_judged(vec![], &db).await;
+
+    assert_eq!(host_status(&db, "127.0.0.2"), "done");
+}

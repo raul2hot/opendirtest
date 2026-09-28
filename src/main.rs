@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -412,7 +413,11 @@ fn read_seeds(mut raw: Vec<String>, list: Option<&Path>) -> Result<Vec<Url>> {
         let files = if list.is_dir() {
             let mut files: Vec<PathBuf> = std::fs::read_dir(list)?
                 .filter_map(|entry| entry.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|ext| ext == "txt"))
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+                })
                 .collect();
             files.sort();
             files
@@ -499,9 +504,13 @@ fn clean_stored(conn: &mut rusqlite::Connection, cfg: &CrawlConfig) -> Result<bo
     eprintln!("Checking what is stored against the current rules...");
     let report = store::clean(conn, &rules)?;
     print_clean_report(&report);
-    // About 40 MB of freed pages is worth rewriting the file for.
-    if store::compact_if_wasteful(conn, 10_000)? {
-        eprintln!("Compacted the database file (freed space returned to disk).");
+    // About 40 MB of freed pages is worth rewriting the file for. This is only
+    // housekeeping (it can fail while a DB browser holds the file, or when the
+    // disk is full), so a failure is reported and the crawl goes on.
+    match store::compact_if_wasteful(conn, 10_000) {
+        Ok(true) => eprintln!("Compacted the database file (freed space returned to disk)."),
+        Ok(false) => {}
+        Err(e) => eprintln!("warning: could not compact the database file: {e:#}"),
     }
     Ok(!report.is_empty())
 }
@@ -536,6 +545,27 @@ fn print_clean_report(report: &CleanReport) {
     }
 }
 
+/// Adds the folders a site still has waiting in the database to the URLs you
+/// gave for it. Finishing its crawl clears them, so they would be lost, and a
+/// site paused earlier would be recorded as done.
+fn with_waiting_folders(conn: &rusqlite::Connection, mut seeds: Vec<Url>) -> Result<Vec<Url>> {
+    let hosts: HashSet<String> = seeds
+        .iter()
+        .filter_map(filters::canonical_host_of)
+        .collect();
+    let mut known: HashSet<String> = seeds.iter().map(Url::to_string).collect();
+    let mut hosts: Vec<String> = hosts.into_iter().collect();
+    hosts.sort();
+    for host in hosts {
+        for url in store::candidate_urls(conn, &host)? {
+            if known.insert(url.to_string()) {
+                seeds.push(url);
+            }
+        }
+    }
+    Ok(seeds)
+}
+
 async fn run_crawl(
     seeds: Vec<Url>,
     pending: Option<Pending>,
@@ -547,6 +577,7 @@ async fn run_crawl(
     let mut conn = store::open(db)?;
     // Sites you name now are trusted, so the cleanup below cannot judge them.
     store::trust_hosts(&conn, &seeds)?;
+    let seeds = with_waiting_folders(&conn, seeds)?;
     clean_stored(&mut conn, &cfg)?;
     cfg.sensitive_hosts = store::sensitive_hosts(&conn)?.into_iter().collect();
     drop(conn);
@@ -814,6 +845,57 @@ mod tests {
         ] {
             assert!(!skipped(fine), "{fine}");
         }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("opendir-main-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn an_explicit_crawl_continues_the_folders_a_site_has_waiting() {
+        let db = scratch("waiting.db");
+        let conn = store::open(&db).unwrap();
+        let url = |u: &str| Url::parse(u).unwrap();
+        store::add_candidates(
+            &conn,
+            &[
+                url("https://a.example/pub/iso/"),
+                url("https://a.example/pub/doc/"),
+                url("https://other.example/x/"),
+            ],
+            "link",
+        )
+        .unwrap();
+
+        // The site you name is crawled from its waiting folders too; finishing
+        // its crawl would otherwise clear them.
+        let merged = with_waiting_folders(&conn, vec![url("https://A.example./pub/iso/")]).unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                url("https://a.example./pub/iso/"),
+                url("https://a.example/pub/doc/"),
+                url("https://a.example/pub/iso/"),
+            ]
+        );
+        // Other sites are left alone, and a site with nothing waiting is unchanged.
+        let plain = with_waiting_folders(&conn, vec![url("https://c.example/")]).unwrap();
+        assert_eq!(plain, vec![url("https://c.example/")]);
+    }
+
+    #[test]
+    fn a_seeds_folder_reads_txt_files_in_any_case_and_skips_folders() {
+        let dir = scratch("seeds");
+        std::fs::create_dir_all(dir.join("looks-like-a-file.txt")).unwrap();
+        std::fs::write(dir.join("UPPER.TXT"), "https://one.example/pub/\n").unwrap();
+        std::fs::write(dir.join("lower.txt"), "https://two.example/pub/\n").unwrap();
+        std::fs::write(dir.join("notes.md"), "https://three.example/pub/\n").unwrap();
+        let seeds = read_seeds(Vec::new(), Some(&dir)).unwrap();
+        let hosts: Vec<&str> = seeds.iter().filter_map(|u| u.host_str()).collect();
+        assert_eq!(hosts, ["one.example", "two.example"]);
     }
 
     #[test]

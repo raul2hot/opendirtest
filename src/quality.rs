@@ -14,9 +14,11 @@ pub const BIG_FILE: u64 = 10 * 1024 * 1024;
 /// finish, once it has been crawled for this many folders...
 pub const PROBE_DIRS: u64 = 100;
 
-/// ...and only if at least this many files have been seen. A big archive's top
-/// folders hold no files at all (the disk images are four levels down), so a
-/// site with few files so far is not judged until it is finished.
+/// ...and only if at least this many files have been seen in folders that hold
+/// no sub-folders. A big archive's top folders hold README and index files, and
+/// the disk images are further down, so a crawl that is still near the top
+/// says nothing yet. Files in folders that do have sub-folders are not counted
+/// for an unfinished site.
 pub const MIN_EVIDENCE: u64 = 100;
 
 /// Extensions (lower case, without the dot) of files people go looking for.
@@ -26,7 +28,9 @@ const USEFUL_EXTENSIONS: &[&str] = &[
     // archives and disk images
     "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst", "lz", "lzma", "iso", "img", "dmg",
     "vhd", "vhdx", "vmdk", "qcow2", "wim", "squashfs", // installers and packages
-    "exe", "msi", "deb", "rpm", "apk", "appimage", "pkg", "whl", // documents and books
+    "exe", "msi", "deb", "rpm", "apk", "appimage", "pkg", "whl", "bin",
+    // older archive formats, common on software collections
+    "z", "lzh", "lha", "cab", "sit", "arj", "zoo", // documents and books
     "pdf", "epub", "mobi", "azw3", "djvu", "cbz", "cbr", "doc", "docx", "odt", "ppt", "pptx",
     "tex", // audio
     "mp3", "flac", "ogg", "opus", "wav", "m4a", "aac", "wma", "ape", "mid", "midi",
@@ -39,6 +43,13 @@ const USEFUL_EXTENSIONS: &[&str] = &[
     "tif", "tiff", "psd", "cr2", "nef", "arw", "dng", "raw", "svs", "torrent",
 ];
 
+/// Text and data formats that only count when the file is big enough to be a
+/// real book or dataset: a website's `readme.txt` or `sitemap.xml` is not one.
+const TEXT_EXTENSIONS: &[&str] = &["txt", "dat", "xml", "rtf", "ps"];
+
+/// The size from which a text file counts as useful (100 KiB).
+pub const TEXT_FILE_MIN: u64 = 100 * 1024;
+
 /// The extension of a file name, lower case: `Disk.ISO` -> `iso`, `a.tar.gz` -> `gz`.
 pub fn extension(name: &str) -> Option<String> {
     let (stem, ext) = name.rsplit_once('.')?;
@@ -46,8 +57,13 @@ pub fn extension(name: &str) -> Option<String> {
 }
 
 /// True if the file is of a kind people go looking for.
-pub fn is_useful(name: &str) -> bool {
-    extension(name).is_some_and(|ext| USEFUL_EXTENSIONS.contains(&ext.as_str()))
+pub fn is_useful(name: &str, size: Option<u64>) -> bool {
+    let Some(ext) = extension(name) else {
+        return false;
+    };
+    let ext = ext.as_str();
+    USEFUL_EXTENSIONS.contains(&ext)
+        || (TEXT_EXTENSIONS.contains(&ext) && size.is_some_and(|s| s >= TEXT_FILE_MIN))
 }
 
 /// What a site holds, counted over its files (not folders).
@@ -64,7 +80,7 @@ impl Counts {
     pub fn add(&mut self, name: &str, size: Option<u64>) {
         self.files += 1;
         self.big += u64::from(size.is_some_and(|s| s >= BIG_FILE));
-        self.useful += u64::from(is_useful(name));
+        self.useful += u64::from(is_useful(name, size));
     }
 }
 
@@ -97,10 +113,17 @@ impl Thresholds {
         *self != Self::OFF
     }
 
-    /// `Some(reason)` if the site holds too little to be kept. A site that is
-    /// not `finished` is only judged once `MIN_EVIDENCE` files have been seen.
+    /// `Some(reason)` if the site holds too little to be kept.
+    ///
+    /// A finished site is judged by the thresholds. A site that is not finished
+    /// is only dropped when what it holds so far is plainly junk: at least
+    /// `MIN_EVIDENCE` files (counted in folders without sub-folders), nothing
+    /// big, and under 5% useful files. Closer to the thresholds it may still
+    /// get there, so it is left for the verdict at the end.
     pub fn judge(&self, counts: &Counts, finished: bool) -> Option<String> {
-        if !finished && counts.files < MIN_EVIDENCE {
+        if !finished
+            && (counts.files < MIN_EVIDENCE || counts.big > 0 || counts.useful * 20 >= counts.files)
+        {
             return None;
         }
         if counts.big >= self.min_big || counts.useful >= self.min_useful {
@@ -124,13 +147,24 @@ mod tests {
         assert_eq!(extension("README"), None);
         assert_eq!(extension(".env"), None);
         assert_eq!(extension("archive."), None);
-        assert!(is_useful("ubuntu-24.04-desktop-amd64.iso"));
-        assert!(is_useful("Lecture 03.PDF"));
-        assert!(is_useful("song.flac"));
-        assert!(!is_useful("index.html"));
-        assert!(!is_useful("photo-150x150.jpg"));
-        assert!(!is_useful("style.css"));
-        assert!(!is_useful("error_log"));
+        assert!(is_useful("ubuntu-24.04-desktop-amd64.iso", None));
+        assert!(is_useful("Lecture 03.PDF", None));
+        assert!(is_useful("song.flac", None));
+        assert!(is_useful("old-tool.lzh", None));
+        assert!(!is_useful("index.html", None));
+        assert!(!is_useful("photo-150x150.jpg", Some(9_000)));
+        assert!(!is_useful("style.css", None));
+        assert!(!is_useful("error_log", None));
+    }
+
+    #[test]
+    fn text_files_count_only_when_they_are_big() {
+        // A book or a dataset, not a website's readme.
+        assert!(is_useful("moby-dick.txt", Some(1_200_000)));
+        assert!(is_useful("stations.dat", Some(5_000_000)));
+        assert!(!is_useful("readme.txt", Some(900)));
+        assert!(!is_useful("sitemap.xml", Some(30_000)));
+        assert!(!is_useful("notes.txt", None));
     }
 
     #[test]
@@ -171,8 +205,27 @@ mod tests {
         };
         assert_eq!(t.judge(&few, false), None);
         assert!(t.judge(&few, true).is_some());
+        // Plainly junk so far: plenty of files, nothing big, almost nothing useful.
         let many = Counts { files: 400, ..few };
         assert!(t.judge(&many, false).is_some());
+        // Not plainly junk: any big file, or a fair share of useful ones, waits
+        // for the verdict at the end, even if it is under the absolute thresholds.
+        let one_big = Counts { big: 1, ..many };
+        assert_eq!(t.judge(&one_big, false), None);
+        let some_useful = Counts {
+            files: 300,
+            big: 0,
+            useful: 19,
+        };
+        assert_eq!(t.judge(&some_useful, false), None);
+        assert!(t.judge(&some_useful, true).is_some());
+        // Under 5% useful is plainly junk even when a few files are useful.
+        let few_useful = Counts {
+            files: 400,
+            big: 0,
+            useful: 19,
+        };
+        assert!(t.judge(&few_useful, false).is_some());
 
         // Turned off: everything is kept.
         assert!(!Thresholds::OFF.enabled());

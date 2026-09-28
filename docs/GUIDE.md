@@ -22,12 +22,14 @@ while doing it.
    host-sharded async crawler keeps thousands of hosts busy at once, each at about 1 req/s.
    You then get very high total throughput without any distributed rate limiter.
 3. **Hot path in Rust (1.98) or Go (1.27).** Use Python 3.15 only for orchestration and
-   classification.
+   analytics.
 4. **Parse listings as a stream and never download the files.** The file metadata (name,
    size, mtime) is the product.
-5. **Legality is a pipeline stage, not an afterthought.** It covers robots.txt (RFC 9309),
-   an allowlist first, a piracy and sensitive-exposure filter, an opt-out page, and a
-   takedown process.
+5. **Safety is hoisted into constant boolean flags** in [`src/safety.rs`](../src/safety.rs):
+   robots.txt (RFC 9309), per-host rate limit, identifying User-Agent, opt-out list,
+   listed-links-only, sensitive-exposure drop, and takedown list. "Metadata only" is not a
+   flag, because nothing downloads file bodies. Likely piracy is filtered at search time,
+   not during the crawl.
 6. **Storage:** Parquet + DuckDB on a single box, ClickHouse ≥ 26.2 (native text index,
    GA in 2026) at billions of rows, and Meilisearch or Tantivy/Quickwit for user-facing
    relevance search.
@@ -46,7 +48,7 @@ while doing it.
       └───────────────┬──────────────────────────────────────┘
                       ▼
       ┌──────────────────────────────────────────────────────┐
-      │ LEGAL GATE #1: allowlist / deny rules / sensitive?    │──► drop (+ optional notify)
+      │ SAFETY GATE: opt-out list / sensitive exposure?       │──► drop (+ optional notify)
       └───────────────┬──────────────────────────────────────┘
                       ▼
       ┌──────────────────────────────────────────────────────┐
@@ -55,11 +57,8 @@ while doing it.
       └───────────────┬──────────────────────────────────────┘
                       ▼
       ┌──────────────────────────────────────────────────────┐
-      │ LEGAL GATE #2: host-level classifier (rules + LLM)    │──► review queue / exclude
-      └───────────────┬──────────────────────────────────────┘
-                      ▼
-      ┌──────────────────────────────────────────────────────┐
       │ STORE: Parquet → ClickHouse   SEARCH: Meilisearch     │
+      │ + search-time filters: takedown list, likely piracy   │
       └──────────────────────────────────────────────────────┘
 ```
 
@@ -67,18 +66,22 @@ while doing it.
 
 ## 1. Ground rules: what "legal" means in engineering terms
 
-Treat these as hard requirements for the code, not as guidelines.
+Each safety behaviour is a constant boolean flag in [`src/safety.rs`](../src/safety.rs).
+All of them default to `true`, and turning one off is a reviewed code change, not a runtime
+option.
 
-| Rule | Implementation |
-|---|---|
-| Only index what the owner **published** | Only follow links that appear in a listing. **Never** guess paths, run wordlists or dirbusting, try credentials, or exploit misconfigurations (path traversal, `.git` exposure) on hosts you don't own. |
-| Honor robots.txt ([RFC 9309](https://www.rfc-editor.org/rfc/rfc9309)) | Fetch `/robots.txt` before anything else and cache it for ≤ 24 h. **4xx** means allowed. **5xx or unreachable** means treat as fully disallowed. Parse at most 500 KiB. Honor `Crawl-delay` even though the RFC doesn't define it. |
-| Be polite | Default ≤ 1 request/s and ≤ 2 connections per host. On 429/503, back off exponentially and honor `Retry-After`. Stop crawling a host after N consecutive errors. |
-| Be identifiable | Use a descriptive `User-Agent`, e.g. `ODIndexBot/0.1 (+https://yourdomain/bot)`. That page should explain the bot, list your crawler IPs, give an opt-out form and an abuse contact. Set reverse DNS on your crawler IPs. |
-| Metadata only | Store name, size, mtime and URL. **Do not download file bodies.** This keeps you fast and far away from redistribution and liability problems. |
-| Exclude sensitive exposures | If a listing looks accidental (see §6.2), drop the host from the index. Optionally notify the owner via `/.well-known/security.txt` ([RFC 9116](https://www.rfc-editor.org/rfc/rfc9116)). |
-| Exclude likely infringement | Scene-release patterns and cracked software go to the review queue or get excluded (§6.3). |
-| Operate a takedown channel | If you publish a search UI, run a DMCA/notice-and-takedown process and GDPR deletion requests. Filenames can be personal data. |
+| Rule | Flag | Implementation |
+|---|---|---|
+| Only index what the owner **published** | `FOLLOW_LISTED_LINKS_ONLY` | Only follow links that appear in a listing. **Never** guess paths, run wordlists or dirbusting, try credentials, or exploit misconfigurations (path traversal, `.git` exposure) on hosts you don't own. |
+| Honor robots.txt ([RFC 9309](https://www.rfc-editor.org/rfc/rfc9309)) | `RESPECT_ROBOTS_TXT` | Fetch `/robots.txt` before anything else and cache it for ≤ 24 h. **4xx** means allowed. **5xx or unreachable** means treat as fully disallowed. Parse at most 500 KiB. Honor `Crawl-delay` even though the RFC doesn't define it. |
+| Be polite | `ENFORCE_PER_HOST_RATE_LIMIT` | Default ≤ 1 request/s and ≤ 2 connections per host. On 429/503, back off exponentially and honor `Retry-After`. Stop crawling a host after N consecutive errors. |
+| Be identifiable | `SEND_IDENTIFYING_USER_AGENT` | Use a descriptive `User-Agent`, e.g. `ODIndexBot/0.1 (+https://yourdomain/bot)`. That page should explain the bot, list your crawler IPs, give an opt-out form and an abuse contact. Set reverse DNS on your crawler IPs. |
+| Honor opt-outs | `HONOR_OPT_OUT_LIST` | Skip every host whose owner opted out through the bot page. |
+| Exclude sensitive exposures | `DROP_SENSITIVE_EXPOSURES` | If a listing looks accidental (see §6.2), drop the host from the index. Optionally notify the owner via `/.well-known/security.txt` ([RFC 9116](https://www.rfc-editor.org/rfc/rfc9116)). |
+| Operate a takedown channel | `HONOR_TAKEDOWN_LIST` | If you publish a search UI, run a DMCA/notice-and-takedown process and GDPR deletion requests, and hide listed hosts and URLs from results. Filenames can be personal data. |
+| Metadata only | *(not a flag)* | Store name, size, mtime and URL. **Do not download file bodies.** There is no code path for it, so there is nothing to switch. This keeps you fast and far away from redistribution and liability problems. |
+
+Likely infringement is **not** a crawl-time rule. It is filtered at search time (§6.3).
 
 **Active internet-wide scanning (ZMap/masscan on :80/:443)** is legal in many
 jurisdictions and is how Censys and Shodan work. It still brings abuse complaints and ISP
@@ -218,7 +221,7 @@ Treat search APIs as a trickle source, not the main pipe.
 
 ODs link to other ODs through mirror pages, `README` pointers, and "see also" mirror
 listings. Queue any off-host link that appears **inside a listing page** as a new
-candidate host. It still has to pass verification and the legal gates.
+candidate host. It still has to pass verification and the safety gate.
 
 ---
 
@@ -267,8 +270,8 @@ pages". ODs are a tree walk with a very regular structure. A purpose-built walke
 1–2k lines, with per-format extractors and trap guards, is simpler and faster. Read
 spider-rs for ideas and don't depend on it.
 
-Python 3.15 ships on 2026-10-01 with free-threading and a faster JIT. It's fine for the
-classifier, orchestration and analytics glue, but not for the fetch and parse hot path.
+Python 3.15 ships on 2026-10-01 with free-threading and a faster JIT. It's fine for
+orchestration and analytics glue, but not for the fetch and parse hot path.
 
 ### 5.2 Scheduler: host-sharded, ready-time heap
 
@@ -392,10 +395,12 @@ sysctl -w net.netfilter.nf_conntrack_max=4194304
 
 | Tier | Source | Action |
 |---|---|---|
-| 0 | Official mirror networks, `.gov`, `.edu`, `.ac.*`, known open-data portals | Index automatically, with higher crawl budgets |
-| 1 | Passed the classifier with high confidence as software, dataset, academic or open-licensed | Index automatically |
-| 2 | Low confidence or mixed signals | Human review queue, not public yet |
-| X | Sensitive exposure or likely infringement | Exclude, keep only a tombstone (host plus reason) so you don't re-crawl |
+| 0 | Official mirror networks, `.gov`, `.edu`, `.ac.*`, known open-data portals | Index, with higher crawl budgets |
+| 1 | Every other verified open directory | Index, with default budgets |
+| X | Sensitive exposure, opt-out, or whole-host takedown | Exclude, keep only a tombstone (host plus reason) so you don't re-crawl |
+
+There is no per-host content classifier; it was dropped because of its cost. Likely
+piracy is handled at search time instead (§6.3).
 
 ### 6.2 Sensitive-exposure detector: exclude and don't index
 
@@ -407,9 +412,12 @@ in home-style directories, and anything under `/home/<user>/`.
 These are almost always accidental exposures. Don't fetch them, don't index them, and
 consider a courtesy notice via `security.txt`.
 
-### 6.3 Likely-infringement heuristics
+### 6.3 Likely-infringement filter (search time, not crawl time)
 
-Use these as signals, not proof. Combine several of them at the directory level:
+The crawler indexes every verified host outside tier X. Likely piracy is filtered in the
+search layer, either as a `NOT match(name, …)` clause in the query or as a boolean
+attribute computed while loading the search index. Changing the rules then needs a
+re-index at most, never a re-crawl. Use these patterns as signals, not proof:
 
 ```regex
 (?i)\b(2160p|1080p|720p|x26[45]|hevc|web-?dl|webrip|bluray|brrip|hdrip|dvdrip|remux)\b
@@ -418,23 +426,8 @@ Use these as signals, not proof. Combine several of them at the directory level:
 \.[A-Za-z0-9-]+-[A-Za-z0-9]{2,12}\.(mkv|mp4|avi)$   # dotted release name ending in -GROUP (weak alone)
 ```
 
-Also look at the extension histogram. A directory that is mostly `.mkv`/`.iso`/`.nsp`/
-`.xci` with release-style names, on a host that isn't in the allowlist, gets tier X or 2.
-
-### 6.4 Host-level classifier (cheap, because it runs per host)
-
-Build a compact summary per host: hostname, server header, top-level directory names, an
-extension histogram, 200 sampled filenames and the total size. Classify it into
-`{software-mirror, dataset, academic, open-media, personal-files, likely-infringing,
-sensitive-exposure, unknown}` with a confidence score.
-
-- Start with the rules from §6.2 and §6.3.
-- Add a small LLM pass for the rest. Either a hosted small model through a batch API
-  (e.g. Claude Haiku 4.5 through the Message Batches API) or a local small model under
-  vLLM or llama.cpp.
-- You classify **one summary per host**, not per file, so even 1M hosts is cheap.
-- Low confidence goes to tier 2. Keep a labelled set from human reviews and measure
-  precision and recall every week.
+Skip the filter for tier 0 hosts, since official mirrors legitimately carry names like
+`patch` or `serial`.
 
 ---
 
@@ -458,14 +451,14 @@ CREATE TABLE files (
   mtime       DateTime,
   first_seen  DateTime,
   last_seen   DateTime,
-  tier        Enum8('t0'=0,'t1'=1,'t2'=2,'x'=3),
+  tier        Enum8('t0'=0,'t1'=1,'x'=2),
   INDEX name_text name TYPE text(tokenizer = 'splitByNonAlpha')
 ) ENGINE = ReplacingMergeTree(last_seen)
 ORDER BY (host, dir, name);
 
 CREATE TABLE hosts (
   host String, ip String, asn UInt32, server String, fingerprint LowCardinality(String),
-  robots_ok UInt8, tier Enum8('t0'=0,'t1'=1,'t2'=2,'x'=3), class LowCardinality(String),
+  robots_ok UInt8, tier Enum8('t0'=0,'t1'=1,'x'=2),
   n_dirs UInt64, n_files UInt64, total_bytes UInt64, listing_cluster UInt64,
   first_seen DateTime, last_crawled DateTime
 ) ENGINE = ReplacingMergeTree(last_crawled) ORDER BY host;
@@ -479,7 +472,8 @@ can then re-parse after fixing a parser bug without re-crawling.
 
 For the search UI, index `name` and `dir` tokens, filter by `ext`, `size` and `tier`, and
 collapse results by `listing_cluster` so that 400 identical Debian mirrors appear as one
-result with a mirror picker.
+result with a mirror picker. Apply the search-time filters here: the takedown list
+(`HONOR_TAKEDOWN_LIST`) and the likely-infringement patterns (§6.3).
 
 ---
 
@@ -498,7 +492,6 @@ Gbit/s.
 - N fetcher nodes, each owning a consistent-hash range of registered domains.
 - NATS JetStream (or Redpanda) carries discovered candidates and parsed batches.
 - ClickHouse cluster, plus Quickwit or Meilisearch.
-- Classifier workers in Python 3.15.
 - Everything observable with OpenTelemetry.
 
 ---
@@ -511,9 +504,10 @@ Gbit/s.
 3. **Scheduler:** host-sharded ready-heap, a global in-flight cap, metrics.
 4. **Discovery v1:** the Common Crawl query (§3.1) plus mirror lists, reaching the first
    10k hosts.
-5. **Legal gates:** the rules from §6.2 and §6.3, the tier system, the bot info and
-   opt-out page.
-6. **Storage and search:** Parquet → DuckDB → Meilisearch.
+5. **Safety flags wired in:** every flag in `src/safety.rs` checked at its call site, the
+   §6.2 rules, the tier system, the bot info and opt-out page.
+6. **Storage and search:** Parquet → DuckDB → Meilisearch, with the search-time filters
+   (takedown list, §6.3 patterns).
 7. **Discovery v2:** Censys Platform and Shodan, CT tailing (static-ct-api), link
    expansion.
 8. **Recrawl:** mtime-guided incremental recrawl, adaptive per-host rate.

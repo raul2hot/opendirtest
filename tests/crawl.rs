@@ -21,6 +21,8 @@ fn fast_config() -> CrawlConfig {
     CrawlConfig {
         concurrency: 4,
         per_host_delay: Duration::from_millis(5),
+        // The test servers live on localhost.
+        allow_private_links: true,
         ..CrawlConfig::default()
     }
 }
@@ -86,6 +88,7 @@ fn search(db: &Path, query: &str, unfiltered: bool, takedown: Vec<String>) -> Ve
         ext: None,
         unfiltered,
         takedown,
+        optout: vec![],
     };
     store::search(&conn, query, opts)
         .unwrap()
@@ -489,4 +492,114 @@ async fn links_to_other_sites_are_crawled_in_the_same_run() {
     assert_eq!(search(&db, "mirror file", true, vec![]).len(), 1);
     assert_eq!(search(&db, "dataset", true, vec![]).len(), 1);
     assert!(pending_urls(&db).is_empty());
+}
+
+#[tokio::test]
+async fn a_homepage_candidate_does_not_hide_a_listing_below_it() {
+    let server = serve(routes(vec![
+        (
+            "/",
+            Route::new(200, Some("text/html"), "<title>Welcome</title>"),
+        ),
+        ("/pub/", listing("/pub/", &[("tool.tar.gz", 10)])),
+    ]))
+    .await;
+    let db = temp_db("homepage");
+    let conn = store::open(&db).unwrap();
+    let seeds = [server.base.clone(), server.base.join("pub/").unwrap()];
+    store::add_candidates(&conn, &seeds, "link").unwrap();
+    drop(conn);
+
+    run_with_pending(vec![], &db, fast_config()).await;
+
+    assert!(server.requested().contains(&"/pub/".to_string()));
+    assert_eq!(search(&db, "tool", true, vec![]).len(), 1);
+    assert_eq!(host_status(&db, "127.0.0.1"), "done");
+}
+
+#[tokio::test]
+async fn links_to_private_networks_are_not_recorded() {
+    let body = "<title>Index of /</title><pre>\
+        <a href=\"http://192.168.1.1/admin/\">router</a>\
+        <a href=\"http://nas.local/share/\">nas</a>\
+        <a href=\"https://mirror.example.org/pub/\">mirror</a>\n</pre>";
+    let server = serve(routes(vec![(
+        "/",
+        Route::new(200, Some("text/html"), body),
+    )]))
+    .await;
+    let db = temp_db("private-links");
+    let cfg = CrawlConfig {
+        allow_private_links: false,
+        ..fast_config()
+    };
+
+    run_crawl(vec![server.base.clone()], &db, cfg).await;
+
+    assert_eq!(pending_urls(&db), vec!["https://mirror.example.org/pub/"]);
+}
+
+#[tokio::test]
+async fn opting_out_removes_what_was_already_indexed() {
+    let server = serve(routes(vec![("/", listing("/", &[("report.pdf", 10)]))])).await;
+    let db = temp_db("optout");
+    run_crawl(vec![server.base.clone()], &db, fast_config()).await;
+    assert_eq!(search(&db, "report", true, vec![]).len(), 1);
+
+    // Hidden from search as soon as the owner is on the list...
+    let conn = store::open(&db).unwrap();
+    let optout = vec!["127.0.0.1".to_string()];
+    let opts = SearchOptions {
+        limit: 10,
+        ext: None,
+        unfiltered: true,
+        takedown: vec![],
+        optout: optout.clone(),
+    };
+    assert!(store::search(&conn, "report", opts).unwrap().is_empty());
+
+    // ...and deleted when the next crawl starts, keeping only the status.
+    assert_eq!(
+        store::apply_optout(&conn, &optout).unwrap(),
+        vec!["127.0.0.1"]
+    );
+    drop(conn);
+    assert_eq!(host_status(&db, "127.0.0.1"), "opted_out");
+    let rows: i64 = query_one(&db, "SELECT count(*) FROM entries");
+    assert_eq!(rows, 0);
+
+    // A crawl of an opted-out site sends nothing and stores nothing.
+    let before = server.requested().len();
+    let cfg = CrawlConfig {
+        optout,
+        ..fast_config()
+    };
+    run_crawl(vec![server.base.clone()], &db, cfg).await;
+    assert_eq!(server.requested().len(), before);
+}
+
+#[tokio::test]
+async fn the_writer_waits_for_another_program_holding_the_database() {
+    let server = serve(routes(vec![
+        ("/", listing("/", &[("sub/", 0), ("a.txt", 1)])),
+        ("/sub/", listing("/sub/", &[("b.txt", 1)])),
+    ]))
+    .await;
+    let db = temp_db("locked");
+    drop(store::open(&db).unwrap());
+
+    // Another program takes the write lock for a while, like a DB browser with
+    // unsaved edits. The crawl must wait for it, not drop its updates.
+    let other = rusqlite::Connection::open(&db).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        other.execute_batch("COMMIT").unwrap();
+    });
+
+    run_crawl(vec![server.base.clone()], &db, fast_config()).await;
+    holder.join().unwrap();
+
+    assert_eq!(host_status(&db, "127.0.0.1"), "done");
+    assert_eq!(search(&db, "txt", true, vec![]).len(), 2);
 }

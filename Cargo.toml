@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 arrow-array = "60"
+arrow-schema = "60"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"

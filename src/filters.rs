@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::RegexSet;
-use url::Url;
+use url::{Host, Url};
 
 /// File or directory names that almost always mean a listing was exposed by
 /// accident. Deliberately narrow: public keys, `.pem` bundles and dataset SQL
@@ -91,13 +91,65 @@ fn decode_text(bytes: &[u8]) -> String {
     }
 }
 
-/// Lower-cases a domain and converts international names to the ASCII form
-/// that URLs use, so opt-out entries match crawled hosts.
-pub fn normalize_domain(domain: &str) -> String {
+/// Turns an opt-out entry into a host name as crawled URLs have it: accepts a
+/// bare domain, a URL, `*.domain` and a trailing dot; lower-cases it and
+/// converts international names to their ASCII form.
+pub fn normalize_domain(entry: &str) -> String {
+    let entry = entry.trim();
+    let from_url = entry
+        .contains("://")
+        .then(|| Url::parse(entry).ok()?.host_str().map(str::to_owned))
+        .flatten();
+    let domain = from_url.unwrap_or_else(|| entry.to_string());
+    let domain = domain.trim_start_matches("*.").trim_end_matches('.');
     Url::parse(&format!("http://{domain}/"))
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
         .unwrap_or_else(|| domain.to_ascii_lowercase())
+}
+
+/// False for hosts on a local or private network (`localhost`, `192.168.x.x`,
+/// `*.local`, ...). Links and redirects there are never recorded as sites to
+/// crawl, so a listing can't point the crawler into your own network.
+pub fn is_public_host(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(domain)) => {
+            const LOCAL: [&str; 6] = [
+                ".localhost",
+                ".local",
+                ".internal",
+                ".lan",
+                ".home.arpa",
+                ".intranet",
+            ];
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            domain.contains('.')
+                && domain != "localhost"
+                && !LOCAL.iter().any(|suffix| domain.ends_with(suffix))
+        }
+        Some(Host::Ipv4(ip)) => {
+            let [a, b, ..] = ip.octets();
+            let shared = a == 100 && (64..128).contains(&b); // carrier-grade NAT
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || shared)
+        }
+        Some(Host::Ipv6(ip)) => {
+            let mapped_private = ip.to_ipv4_mapped().is_some_and(|v4| {
+                v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+            });
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || mapped_private)
+        }
+        None => false,
+    }
 }
 
 /// Normalises a takedown URL prefix the same way crawled URLs are stored
@@ -207,8 +259,41 @@ mod tests {
     }
 
     #[test]
+    fn public_hosts() {
+        let public = |u: &str| is_public_host(&Url::parse(u).unwrap());
+        assert!(public("https://mirror.example.org/pub/"));
+        assert!(public("http://8.8.8.8/"));
+        assert!(public("http://[2001:4860:4860::8888]/"));
+        for private in [
+            "http://localhost:8000/",
+            "http://printer/",
+            "http://nas.local/",
+            "http://router.home.arpa/",
+            "http://127.0.0.1/",
+            "http://192.168.1.1/",
+            "http://10.0.0.5/",
+            "http://172.16.3.4/",
+            "http://169.254.1.1/",
+            "http://100.64.0.1/",
+            "http://[::1]/",
+            "http://[fd00::1]/",
+            "http://[fe80::1]/",
+            "http://[::ffff:192.168.1.1]/",
+        ] {
+            assert!(!public(private), "{private}");
+        }
+    }
+
+    #[test]
     fn normalisation() {
         assert_eq!(normalize_domain("Example.ORG"), "example.org");
+        assert_eq!(
+            normalize_domain("https://Example.org/some/path"),
+            "example.org"
+        );
+        assert_eq!(normalize_domain("*.example.org"), "example.org");
+        assert_eq!(normalize_domain("example.org."), "example.org");
+        assert_eq!(normalize_domain("  example.org  "), "example.org");
         assert_eq!(normalize_domain("bücher.example"), "xn--bcher-kva.example");
         assert_eq!(
             normalize_url_prefix("HTTPS://H.Example:443/pub/my file"),

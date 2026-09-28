@@ -138,6 +138,8 @@ SQLite tool.
 - **robots.txt first**, following RFC 9309, for every scheme/host/port the crawl touches,
   including redirect targets. A 4xx means no rules. A 5xx, 429 or network error means
   stay out.
+- **Stays out of private networks.** Links or redirects to `localhost`, private IP
+  ranges or names like `*.local` are never added to the waiting list.
 - **Never downloads files.** Only pages served as HTML or JSON are read; anything else,
   including a response without a Content-Type, is skipped unread.
 - **Listing parser** for Apache, nginx (plain and fancyindex), lighttpd, IIS, Python
@@ -170,7 +172,8 @@ Disallow: /
 ```
 
 You can also open an issue on this repository to have your domain added to
-[`lists/optout.txt`](lists/optout.txt). For takedown or deletion requests, open an
+[`lists/optout.txt`](lists/optout.txt). A site on that list is hidden from search at
+once, and its indexed files are deleted at the start of the next crawl. For takedown or deletion requests, open an
 issue with the URLs; they go into [`lists/takedown.txt`](lists/takedown.txt).
 
 ## Limits

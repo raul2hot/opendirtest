@@ -1,2 +1,4 @@
-# Site owners who asked not to be crawled. One domain per line; a domain also
-# covers its subdomains. Checked before any request is sent (HONOR_OPT_OUT_LIST).
+# Site owners who asked not to be crawled. One entry per line: a domain
+# (example.org), *.example.org, or a URL (https://example.org/). A domain also
+# covers its subdomains. Checked before any request is sent, hidden from search,
+# and already-indexed files are deleted at the next crawl (HONOR_OPT_OUT_LIST).

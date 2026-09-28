@@ -176,11 +176,11 @@ async fn finds_listings_reading_only_a_fraction_of_the_index() {
         .flat_map(|(_, urls)| urls.into_iter().map(String::from))
         .collect();
     found.sort();
-    // `/pub/linux/` is dropped because its parent `/pub/` is also a candidate.
     assert_eq!(
         found,
         vec![
             "https://ftp.example.org/pub/",
+            "https://ftp.example.org/pub/linux/",
             "https://mirror.example.net/data/"
         ]
     );

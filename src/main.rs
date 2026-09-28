@@ -96,6 +96,9 @@ enum Command {
         /// Takedown list: one URL prefix per line
         #[arg(long, default_value = "lists/takedown.txt")]
         takedown: PathBuf,
+        /// Opt-out list: sites on it are never shown
+        #[arg(long, default_value = "lists/optout.txt")]
+        optout: PathBuf,
     },
     /// Summarise what has been crawled and what is waiting
     Stats {
@@ -181,6 +184,7 @@ async fn main() -> Result<()> {
             ext,
             unfiltered,
             takedown,
+            optout,
         } => {
             let conn = store::open_existing(&db)?;
             let takedown = load_list_or_warn(&takedown, "takedown")?
@@ -192,6 +196,7 @@ async fn main() -> Result<()> {
                 ext,
                 unfiltered,
                 takedown,
+                optout: load_optout(&optout)?,
             };
             let hits = store::search(&conn, &query.join(" "), opts)?;
             if hits.is_empty() {
@@ -288,11 +293,15 @@ async fn run_auto(
     print_stats(&db)
 }
 
-fn crawl_config(args: &CrawlArgs) -> Result<CrawlConfig> {
-    let optout = load_list_or_warn(&args.optout, "opt-out")?
+fn load_optout(path: &Path) -> Result<Vec<String>> {
+    Ok(load_list_or_warn(path, "opt-out")?
         .iter()
         .map(|d| filters::normalize_domain(d))
-        .collect();
+        .collect())
+}
+
+fn crawl_config(args: &CrawlArgs) -> Result<CrawlConfig> {
+    let optout = load_optout(&args.optout)?;
     Ok(CrawlConfig {
         concurrency: args.concurrency,
         max_dirs_per_host: args.max_dirs,
@@ -379,9 +388,13 @@ async fn run_crawl(
     stop: CancellationToken,
     progress_every: Duration,
 ) -> Result<()> {
-    cfg.skip_hosts = store::sensitive_hosts(&store::open(db)?)?
-        .into_iter()
-        .collect();
+    let conn = store::open(db)?;
+    // Sites that opted out since they were crawled: keep only the status.
+    for host in store::apply_optout(&conn, &cfg.optout)? {
+        eprintln!("Removed {host}: it is on the opt-out list");
+    }
+    cfg.skip_hosts = store::sensitive_hosts(&conn)?.into_iter().collect();
+    drop(conn);
     let (tx, writer) = store::spawn_writer(db.to_path_buf())?;
     let stats = Arc::new(Stats::default());
     let started = Instant::now();

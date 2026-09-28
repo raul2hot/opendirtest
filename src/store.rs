@@ -12,13 +12,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, bail};
 use percent_encoding::percent_decode_str;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
 use crate::filters;
 use crate::listing::Entry;
-use crate::safety::HONOR_TAKEDOWN_LIST;
+use crate::safety::{HONOR_OPT_OUT_LIST, HONOR_TAKEDOWN_LIST};
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -116,10 +116,6 @@ pub enum Msg {
         host: String,
         entries: Vec<Entry>,
     },
-    /// Deletes everything stored for a host (sensitive exposure found).
-    Purge {
-        host: String,
-    },
     HostDone {
         host: String,
         status: HostStatus,
@@ -127,6 +123,8 @@ pub enum Msg {
         dirs: u64,
         /// Why the host was skipped or dropped, e.g. the file that looked sensitive.
         reason: Option<String>,
+        /// Delete the host's entries too (dropped as sensitive, or opted out).
+        purge: bool,
     },
     /// Directory URLs worth crawling later. Already-known URLs are ignored.
     Candidates {
@@ -140,10 +138,12 @@ pub enum Msg {
         finished: Vec<Url>,
         frontier: Vec<Url>,
     },
-    /// A Common Crawl index file has been fully scanned.
+    /// A Common Crawl index file was scanned completely. Its listings are stored
+    /// together with the mark, so a file is never marked done without them.
     CcFileDone {
         path: String,
-        candidates: u64,
+        urls: Vec<Url>,
+        source: String,
     },
     /// Replies once everything sent before it is committed.
     Flush(oneshot::Sender<()>),
@@ -198,27 +198,39 @@ pub fn spawn_writer(
     let (tx, mut rx) = mpsc::channel::<Msg>(1024);
     let handle = std::thread::spawn(move || -> Result<()> {
         while let Some(first) = rx.blocking_recv() {
-            let txn = conn.transaction()?;
-            // A failing statement only undoes itself; log it and keep the rest of the batch.
-            let mut flushes = Vec::new();
-            let mut next = Some(first);
-            let mut batched = 0;
-            while let Some(msg) = next.take() {
-                match msg {
-                    Msg::Flush(reply) => flushes.push(reply),
-                    msg => {
-                        if let Err(e) = apply(&txn, msg) {
-                            eprintln!("database: skipped one update: {e:#}");
-                        }
-                    }
-                }
-                batched += 1;
-                // Batch whatever else is already queued into the same transaction.
-                if batched < 10_000 {
-                    next = rx.try_recv().ok();
+            // Batch whatever else is already queued into the same transaction.
+            let mut batch = vec![first];
+            while batch.len() < 10_000 {
+                match rx.try_recv() {
+                    Ok(msg) => batch.push(msg),
+                    Err(_) => break,
                 }
             }
-            txn.commit().context("committing to the database")?;
+            let mut flushes = Vec::new();
+            let msgs: Vec<Msg> = batch
+                .into_iter()
+                .filter_map(|msg| match msg {
+                    Msg::Flush(reply) => {
+                        flushes.push(reply);
+                        None
+                    }
+                    msg => Some(msg),
+                })
+                .collect();
+
+            // Another program holding the write lock (a DB browser with unsaved
+            // edits, another opendir) is waited out: 60 s per try, 10 tries.
+            let mut tries = 0;
+            loop {
+                match write_batch(&mut conn, &msgs) {
+                    Ok(()) => break,
+                    Err(e) if is_busy(&e) && tries < 10 => {
+                        tries += 1;
+                        eprintln!("database is locked by another program; still waiting...");
+                    }
+                    Err(e) => return Err(e).context("writing to the database"),
+                }
+            }
             for reply in flushes {
                 let _ = reply.send(());
             }
@@ -228,7 +240,30 @@ pub fn spawn_writer(
     Ok((tx, handle))
 }
 
-fn apply(conn: &Connection, msg: Msg) -> Result<()> {
+/// Writes a batch in one transaction. The write lock is taken first
+/// (`IMMEDIATE`), so a busy database is waited for instead of failing halfway.
+/// Each message is applied atomically: one that fails is undone and logged,
+/// and the rest of the batch is kept.
+fn write_batch(conn: &mut Connection, msgs: &[Msg]) -> rusqlite::Result<()> {
+    let mut txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for msg in msgs {
+        let savepoint = txn.savepoint()?;
+        match apply(&savepoint, msg) {
+            Ok(()) => savepoint.commit()?,
+            Err(e) => eprintln!("database: skipped one update: {e:#}"),
+        }
+    }
+    txn.commit()
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
     let now = unix_now();
     match msg {
         Msg::Entries { host, entries } => {
@@ -255,16 +290,17 @@ fn apply(conn: &Connection, msg: Msg) -> Result<()> {
                 ])?;
             }
         }
-        Msg::Purge { host } => {
-            conn.execute("DELETE FROM entries WHERE host = ?1", [&host])?;
-        }
         Msg::HostDone {
             host,
             status,
             server,
             dirs,
             reason,
+            purge,
         } => {
+            if *purge {
+                conn.execute("DELETE FROM entries WHERE host = ?1", [host])?;
+            }
             conn.execute(
                 "INSERT INTO hosts (host, status, server, dirs, files, bytes, crawled_at, reason)
                  SELECT ?1, ?2, ?3, ?4, count(*), CAST(total(size) AS INTEGER), ?5, ?6
@@ -275,13 +311,13 @@ fn apply(conn: &Connection, msg: Msg) -> Result<()> {
                         + CASE WHEN hosts.status = 'paused' THEN hosts.dirs ELSE 0 END,
                     files = excluded.files, bytes = excluded.bytes,
                     crawled_at = excluded.crawled_at, reason = excluded.reason",
-                params![host, status.as_str(), server, dirs as i64, now, reason],
+                params![host, status.as_str(), server, *dirs as i64, now, reason],
             )?;
-            if status != HostStatus::Paused {
-                conn.execute("DELETE FROM candidates WHERE host = ?1", [&host])?;
+            if *status != HostStatus::Paused {
+                conn.execute("DELETE FROM candidates WHERE host = ?1", [host])?;
             }
         }
-        Msg::Candidates { urls, source } => insert_candidates(conn, &urls, &source, now)?,
+        Msg::Candidates { urls, source } => insert_candidates(conn, urls, source, now)?,
         Msg::Paused {
             host,
             finished,
@@ -298,15 +334,15 @@ fn apply(conn: &Connection, msg: Msg) -> Result<()> {
             for url in finished {
                 stmt.execute([url.as_str()])?;
             }
-            insert_candidates(conn, &frontier, RESUME_SOURCE, now)?;
+            insert_candidates(conn, frontier, RESUME_SOURCE, now)?;
         }
-        Msg::Flush(reply) => {
-            let _ = reply.send(());
-        }
-        Msg::CcFileDone { path, candidates } => {
+        // Handled by the writer loop; nothing to store.
+        Msg::Flush(_) => {}
+        Msg::CcFileDone { path, urls, source } => {
+            insert_candidates(conn, urls, source, now)?;
             conn.execute(
                 "INSERT OR REPLACE INTO cc_files (path, candidates, done_at) VALUES (?1, ?2, ?3)",
-                params![path, candidates as i64, now],
+                params![path, urls.len() as i64, now],
             )?;
         }
     }
@@ -342,8 +378,9 @@ fn insert_candidates(conn: &Connection, urls: &[Url], source: &str, now: i64) ->
 }
 
 /// Up to `want` hosts with work to do, oldest first, skipping `exclude` (hosts
-/// already being crawled). Each comes with its seed URLs; a URL is dropped when
-/// one of its ancestor directories is also a seed, since the crawl reaches it.
+/// already being crawled). Each comes with all its seed URLs. They are not
+/// pruned to the shallowest: a site's `/` is often a homepage rather than a
+/// listing, so `/pub/` must stay a seed. The crawler never fetches a URL twice.
 pub fn pending_hosts(
     conn: &Connection,
     want: usize,
@@ -362,7 +399,6 @@ pub fn pending_hosts(
         .collect::<rusqlite::Result<_>>()?;
 
     let mut hosts: Vec<(String, Vec<Url>)> = Vec::new();
-    let mut kept: Vec<String> = Vec::new();
     for (host, raw) in rows {
         if exclude.contains(&host) {
             continue;
@@ -372,21 +408,43 @@ pub fn pending_hosts(
                 break;
             }
             hosts.push((host, Vec::new()));
-            kept.clear();
         }
-        let Ok(url) = Url::parse(&raw) else { continue };
-        // Shorter URLs come first, so any ancestor is already in `kept`.
-        if !kept
-            .iter()
-            .any(|ancestor| raw.starts_with(ancestor.as_str()))
-        {
-            kept.push(raw);
-            if let Some((_, seeds)) = hosts.last_mut() {
-                seeds.push(url);
-            }
+        if let (Ok(url), Some((_, seeds))) = (Url::parse(&raw), hosts.last_mut()) {
+            seeds.push(url);
         }
     }
     Ok(hosts)
+}
+
+/// Drops every known host that is on the opt-out list: its entries and waiting
+/// work are deleted and only the `opted_out` status is kept. Returns them.
+pub fn apply_optout(conn: &Connection, optout: &[String]) -> Result<Vec<String>> {
+    if !HONOR_OPT_OUT_LIST || optout.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT host FROM hosts WHERE status != 'opted_out'
+         UNION SELECT host FROM candidates",
+    )?;
+    let hosts: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let dropped: Vec<String> = hosts
+        .into_iter()
+        .filter(|h| filters::host_opted_out(h, optout))
+        .collect();
+    for host in &dropped {
+        let msg = Msg::HostDone {
+            host: host.clone(),
+            status: HostStatus::OptedOut,
+            server: None,
+            dirs: 0,
+            reason: Some("on the opt-out list".into()),
+            purge: true,
+        };
+        apply(conn, &msg)?;
+    }
+    Ok(dropped)
 }
 
 /// Removes everything known about a host (crawl result, entries, candidates),
@@ -425,6 +483,8 @@ pub struct SearchOptions {
     pub unfiltered: bool,
     /// URL prefixes hidden from results (`HONOR_TAKEDOWN_LIST`).
     pub takedown: Vec<String>,
+    /// Opted-out domains, hidden from results even before a crawl drops them.
+    pub optout: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -444,16 +504,19 @@ pub fn search(conn: &Connection, query: &str, opts: SearchOptions) -> Result<Vec
         ext,
         unfiltered,
         takedown,
+        optout,
     } = opts;
     conn.create_scalar_function(
         "hidden",
-        2,
+        3,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         move |ctx| {
             let url = ctx.get_raw(0).as_str().unwrap_or("");
             let name = ctx.get_raw(1).as_str().unwrap_or("");
+            let host = ctx.get_raw(2).as_str().unwrap_or("");
             let taken_down = HONOR_TAKEDOWN_LIST && filters::url_taken_down(url, &takedown);
-            Ok(taken_down || (!unfiltered && filters::is_likely_infringing(name)))
+            let opted_out = HONOR_OPT_OUT_LIST && filters::host_opted_out(host, &optout);
+            Ok(taken_down || opted_out || (!unfiltered && filters::is_likely_infringing(name)))
         },
     )?;
 
@@ -463,7 +526,9 @@ pub fn search(conn: &Connection, query: &str, opts: SearchOptions) -> Result<Vec
          JOIN entries e ON e.rowid = entries_fts.rowid
          WHERE entries_fts MATCH ?1
            AND (?2 IS NULL OR (e.is_dir = 0 AND substr(lower(e.name), -length(?2) - 1) = '.' || ?2))
-           AND NOT hidden(e.url, e.name)
+           AND NOT hidden(e.url, e.name, e.host)
+           AND NOT EXISTS (SELECT 1 FROM hosts h
+                           WHERE h.host = e.host AND h.status IN ('opted_out', 'sensitive'))
          ORDER BY bm25(entries_fts, 10.0, 1.0)
          LIMIT ?3",
     )?;
@@ -593,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_candidates_skip_crawled_hosts_and_covered_dirs() {
+    fn pending_hosts_skip_finished_and_busy_hosts() {
         let conn = open(&temp_path("candidates")).unwrap();
         let urls = [
             "https://a.example/pub/",
@@ -607,7 +672,7 @@ mod tests {
         .collect();
         apply(
             &conn,
-            Msg::Candidates {
+            &Msg::Candidates {
                 urls,
                 source: "test".into(),
             },
@@ -619,8 +684,9 @@ mod tests {
             server: None,
             dirs: 1,
             reason: None,
+            purge: false,
         };
-        apply(&conn, done).unwrap();
+        apply(&conn, &done).unwrap();
 
         let none = HashSet::new();
         let pending = pending_hosts(&conn, 10, &none).unwrap();
@@ -633,6 +699,7 @@ mod tests {
             vec![
                 "https://a.example/pub/",
                 "https://a.example/data/",
+                "https://a.example/pub/linux/",
                 "https://b.example/files/"
             ]
         );
@@ -674,15 +741,16 @@ mod tests {
                 url("https://m.example/pub/c/"),
             ],
         };
-        apply(&conn, paused).unwrap();
+        apply(&conn, &paused).unwrap();
         let status = Msg::HostDone {
             host: "m.example".into(),
             status: HostStatus::Paused,
             server: None,
             dirs: 3,
             reason: None,
+            purge: false,
         };
-        apply(&conn, status).unwrap();
+        apply(&conn, &status).unwrap();
 
         let pending = pending_hosts(&conn, 10, &HashSet::new()).unwrap();
         let urls: Vec<&str> = pending[0].1.iter().map(Url::as_str).collect();
@@ -703,8 +771,9 @@ mod tests {
             server: None,
             dirs: 2,
             reason: None,
+            purge: false,
         };
-        apply(&conn, done).unwrap();
+        apply(&conn, &done).unwrap();
         let dirs: i64 = conn
             .query_row("SELECT dirs FROM hosts WHERE host = 'm.example'", [], |r| {
                 r.get(0)

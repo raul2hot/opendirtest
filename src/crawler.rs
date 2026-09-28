@@ -66,6 +66,9 @@ pub struct CrawlConfig {
     pub optout: Vec<String>,
     /// Hosts dropped as sensitive exposures in earlier runs.
     pub skip_hosts: HashSet<String>,
+    /// Record links to local and private-network hosts as sites to crawl.
+    /// Only for tests against local servers.
+    pub allow_private_links: bool,
 }
 
 impl Default for CrawlConfig {
@@ -77,6 +80,7 @@ impl Default for CrawlConfig {
             per_host_delay: Duration::from_secs(1),
             optout: Vec::new(),
             skip_hosts: HashSet::new(),
+            allow_private_links: false,
         }
     }
 }
@@ -339,6 +343,8 @@ struct Report {
     server: Option<&'static str>,
     dirs: u64,
     reason: Option<String>,
+    /// Delete what was stored for the host.
+    purge: bool,
 }
 
 impl HostCrawl {
@@ -351,6 +357,7 @@ impl HostCrawl {
                 server: report.server.map(str::to_owned),
                 dirs: report.dirs,
                 reason: report.reason,
+                purge: report.purge,
             };
             let _ = self.tx.send(msg).await;
         }
@@ -360,14 +367,15 @@ impl HostCrawl {
     /// Breadth-first walk of the host's directory tree. `None` means nothing
     /// should be recorded (stopped before anything happened, or already dropped).
     async fn walk(&mut self, seeds: Vec<Url>) -> Option<Report> {
-        let report = |status, reason: &str| Report {
-            status,
-            server: None,
-            dirs: 0,
-            reason: Some(reason.to_string()),
-        };
         if HONOR_OPT_OUT_LIST && filters::host_opted_out(&self.host, &self.cfg.optout) {
-            return Some(report(HostStatus::OptedOut, "on the opt-out list"));
+            // Also removes anything indexed before the owner opted out.
+            return Some(Report {
+                status: HostStatus::OptedOut,
+                server: None,
+                dirs: 0,
+                reason: Some("on the opt-out list".into()),
+                purge: true,
+            });
         }
         if DROP_SENSITIVE_EXPOSURES && self.cfg.skip_hosts.contains(&self.host) {
             return None; // keeps the reason recorded when it was dropped
@@ -431,17 +439,13 @@ impl HostCrawl {
             server.get_or_insert(listing.server.as_str());
 
             if DROP_SENSITIVE_EXPOSURES && let Some(why) = sensitive_reason(&page_url, &listing) {
-                let _ = self
-                    .tx
-                    .send(Msg::Purge {
-                        host: self.host.clone(),
-                    })
-                    .await;
+                // The purge and the status are stored together, in one message.
                 return Some(Report {
                     status: HostStatus::Sensitive,
                     server,
                     dirs,
                     reason: Some(why),
+                    purge: true,
                 });
             }
 
@@ -538,10 +542,19 @@ impl HostCrawl {
             server,
             dirs,
             reason,
+            purge: false,
         })
     }
 
-    async fn save_candidates(&self, urls: Vec<Url>) {
+    /// Records directories on other sites for a later crawl, except on local
+    /// and private networks.
+    async fn save_candidates(&self, mut urls: Vec<Url>) {
+        if !self.cfg.allow_private_links {
+            urls.retain(filters::is_public_host);
+        }
+        if urls.is_empty() {
+            return;
+        }
         let msg = Msg::Candidates {
             urls,
             source: LINK_SOURCE.to_string(),

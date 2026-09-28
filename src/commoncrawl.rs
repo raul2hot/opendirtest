@@ -18,6 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_schema::ArrowError;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
@@ -34,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::crawler::USER_AGENT;
+use crate::filters;
 use crate::store::Msg;
 
 pub const DATA_URL: &str = "https://data.commoncrawl.org/";
@@ -98,11 +100,17 @@ pub async fn discover(
         .build()?;
 
     let crawl = if cfg.crawl.eq_ignore_ascii_case("latest") {
-        latest_crawl(&client, &cfg.collinfo_url).await?
+        tokio::select! {
+            crawl = latest_crawl(&client, &cfg.collinfo_url) => crawl?,
+            _ = stop.cancelled() => bail!("stopped"),
+        }
     } else {
         cfg.crawl.clone()
     };
-    let all_files = index_files(&client, &cfg.data_url, &crawl).await?;
+    let all_files = tokio::select! {
+        files = index_files(&client, &cfg.data_url, &crawl) => files?,
+        _ = stop.cancelled() => bail!("stopped"),
+    };
     let todo: Vec<String> = all_files
         .iter()
         .filter(|path| !cfg.done_files.contains(*path))
@@ -120,10 +128,19 @@ pub async fn discover(
         .map(|path| {
             let url = cfg.data_url.join(&path);
             let (client, stats, stop) = (client.clone(), stats.clone(), stop.clone());
+            // Each file on its own task, so decoding uses all CPU cores.
+            let scan = tokio::spawn(async move {
+                let file = HttpFile {
+                    client,
+                    url: url?,
+                    stats,
+                };
+                scan_file(file, &stop).await
+            });
             async move {
-                let result = match url {
-                    Ok(url) => scan_file(HttpFile { client, url, stats }, &stop).await,
-                    Err(e) => Err(e.into()),
+                let result = match scan.await {
+                    Ok(result) => result,
+                    Err(e) => Err(anyhow::anyhow!("scan task failed: {e}")),
                 };
                 (path, result)
             }
@@ -142,16 +159,12 @@ pub async fn discover(
                 scanned += 1;
                 stats.files_done.fetch_add(1, Relaxed);
                 stats.candidates.fetch_add(found.len() as u64, Relaxed);
-                let candidates = found.len() as u64;
-                if !found.is_empty() {
-                    let urls = found.into_iter().collect();
-                    let msg = Msg::Candidates {
-                        urls,
-                        source: source.clone(),
-                    };
-                    tx.send(msg).await.context("database writer stopped")?;
-                }
-                let msg = Msg::CcFileDone { path, candidates };
+                // One message, so the file is only marked done together with its finds.
+                let msg = Msg::CcFileDone {
+                    path,
+                    urls: found.into_iter().collect(),
+                    source: source.clone(),
+                };
                 tx.send(msg).await.context("database writer stopped")?;
             }
             Err(e) => {
@@ -247,7 +260,7 @@ async fn scan_file(file: HttpFile, stop: &CancellationToken) -> Result<HashSet<U
     let predicate = ArrowPredicateFn::new(
         ProjectionMask::columns(schema, ["url_query"]),
         |batch: RecordBatch| {
-            let queries = strings(batch.column(0).as_ref());
+            let queries = strings(batch.column(0).as_ref())?;
             Ok(BooleanArray::from_iter(
                 queries.iter().map(|q| Some(q.is_some_and(is_sort_query))),
             ))
@@ -267,8 +280,9 @@ async fn scan_file(file: HttpFile, stop: &CancellationToken) -> Result<HashSet<U
             _ = stop.cancelled() => bail!("stopped"),
         };
         let Some(batch) = batch else { break };
-        for url in strings(batch.column(0).as_ref()).into_iter().flatten() {
-            if let Some(dir) = listing_dir(url) {
+        for url in strings(batch.column(0).as_ref())?.into_iter().flatten() {
+            // A public index can still point at private addresses; skip those.
+            if let Some(dir) = listing_dir(url).filter(filters::is_public_host) {
                 found.insert(dir);
             }
         }
@@ -277,15 +291,20 @@ async fn scan_file(file: HttpFile, stop: &CancellationToken) -> Result<HashSet<U
 }
 
 /// The values of a string column, whichever Arrow string type it was read as.
-fn strings(column: &dyn Array) -> Vec<Option<&str>> {
+/// Any other type is an error: silently matching nothing would mark the file
+/// as scanned with no finds.
+fn strings(column: &dyn Array) -> std::result::Result<Vec<Option<&str>>, ArrowError> {
     if let Some(a) = column.as_string_opt::<i32>() {
-        a.iter().collect()
+        Ok(a.iter().collect())
     } else if let Some(a) = column.as_string_opt::<i64>() {
-        a.iter().collect()
+        Ok(a.iter().collect())
     } else if let Some(a) = column.as_string_view_opt() {
-        a.iter().collect()
+        Ok(a.iter().collect())
     } else {
-        vec![None; column.len()]
+        Err(ArrowError::SchemaError(format!(
+            "expected a string column, found {}",
+            column.data_type()
+        )))
     }
 }
 

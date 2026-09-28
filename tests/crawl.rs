@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{Route, listing, query_one, serve, temp_db};
-use opendirtest::crawler::{self, CrawlConfig, Stats};
+use opendirtest::crawler::{self, CrawlConfig, Pending, Stats};
 use opendirtest::store::{self, SearchOptions};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -35,11 +35,41 @@ async fn run_crawl_with_stop(
     cfg: CrawlConfig,
     stop: CancellationToken,
 ) {
+    run(seeds, None, db, cfg, stop).await
+}
+
+/// Crawls `seeds` plus everything waiting in the database, like `crawl --candidates`.
+async fn run_with_pending(seeds: Vec<Url>, db: &Path, cfg: CrawlConfig) {
+    let pending = Pending {
+        db: db.to_path_buf(),
+        max_hosts: None,
+    };
+    run(seeds, Some(pending), db, cfg, CancellationToken::new()).await
+}
+
+async fn run(
+    seeds: Vec<Url>,
+    pending: Option<Pending>,
+    db: &Path,
+    cfg: CrawlConfig,
+    stop: CancellationToken,
+) {
     let (tx, writer) = store::spawn_writer(db.to_path_buf()).unwrap();
-    crawler::crawl(seeds, cfg, tx, stop, Arc::new(Stats::default()))
+    crawler::crawl(seeds, pending, cfg, tx, stop, Arc::new(Stats::default()))
         .await
         .unwrap();
     writer.join().unwrap().unwrap();
+}
+
+fn pending_urls(db: &Path) -> Vec<String> {
+    let conn = store::open(db).unwrap();
+    let mut urls: Vec<String> = store::pending_hosts(&conn, 100, &Default::default())
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, urls)| urls.into_iter().map(String::from))
+        .collect();
+    urls.sort();
+    urls
 }
 
 fn host_status(db: &Path, host: &str) -> String {
@@ -306,26 +336,94 @@ async fn stop_interrupts_back_off() {
 }
 
 #[tokio::test]
-async fn queue_is_bounded_by_the_directory_budget() {
-    let dirs: Vec<String> = (0..50).map(|i| format!("d{i}/")).collect();
-    let entries: Vec<(&str, u64)> = dirs.iter().map(|d| (d.as_str(), 0)).collect();
-    let server = serve(routes(vec![("/", listing("/", &entries))])).await;
+async fn budget_pauses_the_site_and_the_next_run_continues() {
+    let dirs: Vec<String> = (0..8).map(|i| format!("d{i}/")).collect();
+    let mut list = vec![(
+        "/",
+        listing(
+            "/",
+            &dirs.iter().map(|d| (d.as_str(), 0)).collect::<Vec<_>>(),
+        ),
+    )];
+    let pages: Vec<(String, Route)> = (0..8)
+        .map(|i| {
+            (
+                format!("/d{i}/"),
+                listing(&format!("/d{i}/"), &[(&format!("f{i}.txt"), 1)]),
+            )
+        })
+        .collect();
+    list.extend(pages.iter().map(|(p, r)| (p.as_str(), r.clone())));
+    let server = serve(routes(list)).await;
     let db = temp_db("budget");
-    let cfg = CrawlConfig {
+    let cfg = || CrawlConfig {
         max_dirs_per_host: 3,
         ..fast_config()
     };
 
-    run_crawl(vec![server.base.clone()], &db, cfg).await;
-
-    let requested = server.requested();
-    assert!(
-        requested.len() <= 4,
-        "robots.txt + 3 dirs, got {requested:?}"
-    );
-    assert_eq!(host_status(&db, "127.0.0.1"), "partial");
+    // Run 1: the root plus two directories, then the budget is used up. The
+    // queue is capped at the budget; the rest is saved in the database.
+    run_crawl(vec![server.base.clone()], &db, cfg()).await;
+    assert_eq!(server.requested().len(), 4, "robots.txt + 3 listings");
+    assert_eq!(host_status(&db, "127.0.0.1"), "paused");
     let reason: String = query_one(&db, "SELECT reason FROM hosts");
-    assert_eq!(reason, "directory budget reached");
+    assert!(reason.contains("continues next run"), "{reason}");
+    assert_eq!(pending_urls(&db).len(), 6);
+
+    // Runs 2 and 3 continue where the last one stopped; nothing is fetched twice.
+    run_with_pending(vec![], &db, cfg()).await;
+    run_with_pending(vec![], &db, cfg()).await;
+    let listings: Vec<String> = server
+        .requested()
+        .into_iter()
+        .filter(|p| p != "/robots.txt")
+        .collect();
+    let unique: std::collections::HashSet<_> = listings.iter().collect();
+    assert_eq!(listings.len(), 9, "{listings:?}");
+    assert_eq!(unique.len(), 9, "fetched twice: {listings:?}");
+    assert_eq!(host_status(&db, "127.0.0.1"), "done");
+    assert!(pending_urls(&db).is_empty());
+    assert_eq!(search(&db, "txt", true, vec![]).len(), 8);
+}
+
+#[tokio::test]
+async fn stopping_saves_the_rest_for_the_next_run() {
+    let server = serve(routes(vec![
+        ("/", listing("/", &[("a/", 0), ("b/", 0), ("c/", 0)])),
+        ("/a/", listing("/a/", &[("a.txt", 1)])),
+        ("/b/", listing("/b/", &[("b.txt", 1)])),
+        ("/c/", listing("/c/", &[("c.txt", 1)])),
+    ]))
+    .await;
+    let db = temp_db("resume");
+    // Slow pacing, so the stop lands in the middle of the crawl.
+    let cfg = || CrawlConfig {
+        per_host_delay: Duration::from_millis(300),
+        ..fast_config()
+    };
+    let stop = CancellationToken::new();
+    let canceller = stop.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        canceller.cancel();
+    });
+
+    run_crawl_with_stop(vec![server.base.clone()], &db, cfg(), stop).await;
+
+    assert_eq!(host_status(&db, "127.0.0.1"), "paused");
+    let first_run = server.requested().len();
+    assert!(first_run < 5, "{:?}", server.requested());
+
+    run_with_pending(vec![], &db, cfg()).await;
+    let listings: Vec<String> = server
+        .requested()
+        .into_iter()
+        .filter(|p| p != "/robots.txt")
+        .collect();
+    let unique: std::collections::HashSet<_> = listings.iter().collect();
+    assert_eq!(unique.len(), listings.len(), "fetched twice: {listings:?}");
+    assert_eq!(unique.len(), 4);
+    assert_eq!(host_status(&db, "127.0.0.1"), "done");
 }
 
 #[tokio::test]
@@ -356,7 +454,7 @@ async fn names_only_listings_with_the_same_names_are_both_indexed() {
 }
 
 #[tokio::test]
-async fn links_to_other_sites_become_candidates_and_get_crawled() {
+async fn links_to_other_sites_are_crawled_in_the_same_run() {
     let mirror = serve(routes(vec![
         ("/pub/", listing("/pub/", &[("mirror-file.tar.gz", 10)])),
         ("/data/", listing("/data/", &[("dataset.csv", 10)])),
@@ -374,28 +472,21 @@ async fn links_to_other_sites_become_candidates_and_get_crawled() {
         ("/moved/", Route::redirect(&mirror_data)),
     ]))
     .await;
+
+    // Plain crawl: the mirror is only recorded, not contacted.
     let db = temp_db("links");
-
     run_crawl(vec![site.base.clone()], &db, fast_config()).await;
-
-    // Nothing was sent to the mirror yet: its URLs are only recorded.
     assert!(mirror.requested().is_empty());
-    let conn = store::open(&db).unwrap();
-    let mut pending: Vec<String> = store::pending_candidates(&conn, 10)
-        .unwrap()
-        .into_iter()
-        .map(String::from)
-        .collect();
-    pending.sort();
-    assert_eq!(pending, vec![mirror_data.clone(), mirror_pub.clone()]);
-    drop(conn);
+    assert_eq!(
+        pending_urls(&db),
+        vec![mirror_data.clone(), mirror_pub.clone()]
+    );
 
-    let seeds = pending.iter().map(|u| Url::parse(u).unwrap()).collect();
-    run_crawl(seeds, &db, fast_config()).await;
-
+    // With pending sites included, the mirror found mid-run is crawled in the same run.
+    let db = temp_db("links-same-run");
+    run_with_pending(vec![site.base.clone()], &db, fast_config()).await;
     assert_eq!(host_status(&db, "localhost"), "done");
     assert_eq!(search(&db, "mirror file", true, vec![]).len(), 1);
     assert_eq!(search(&db, "dataset", true, vec![]).len(), 1);
-    let conn = store::open(&db).unwrap();
-    assert!(store::pending_candidates(&conn, 10).unwrap().is_empty());
+    assert!(pending_urls(&db).is_empty());
 }

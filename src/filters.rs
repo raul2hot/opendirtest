@@ -22,7 +22,9 @@ static SENSITIVE_NAMES: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)\.(kdbx|pst|ost|ppk)$",
         r"(?i)^wallet\.dat$",
         r"(?i)(backup|dump|database|mysql|db)[^/]*\.sql(\.(gz|bz2|xz|zip|7z))?$",
-        r"(?i)^(passport|payroll|tax[-_ ]?return|bank[-_ ]?statement)",
+        // Personal documents: only as documents or scans, so that software such
+        // as CRAN's `passport_0.3.0.tar.gz` package does not match.
+        r"(?i)^(passport|payroll|tax[-_ ]?return|bank[-_ ]?statement)[^/]*\.(pdf|jpe?g|png|tiff?|heic|docx?|xlsx?|odt|ods)$",
     ])
     .unwrap()
 });
@@ -138,6 +140,7 @@ mod tests {
             "backup-2026.sql.gz",
             "mysql_dump.sql",
             "payroll_2025.xlsx",
+            "passport-scan.jpg",
         ] {
             assert!(is_sensitive_name(name), "{name} should be sensitive");
         }
@@ -150,6 +153,8 @@ mod tests {
             "environment.yml",
             "taxonomy.txt",
             "gitlab-17.0.tar.gz",
+            "passport_0.3.0.tar.gz",
+            "payroll-engine-2.1.zip",
         ] {
             assert!(!is_sensitive_name(name), "{name} should not be sensitive");
         }

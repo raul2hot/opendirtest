@@ -41,12 +41,12 @@ On Linux or macOS, the same commands work with `./target/release/opendir`.
 
 ## Finding new sites
 
-The crawler only visits sites it has been given. Discovery adds more, as
-*candidates* that the next crawl picks up:
+The crawler only visits sites it has been given. Discovery adds more to a list of
+sites *waiting to crawl*, which `crawl --candidates` (and `auto`) work through:
 
 - **Links between sites (automatic).** When a listing links to a directory on
-  another site, or redirects there, that URL is saved as a candidate. The other
-  site is not contacted until you crawl the candidates.
+  another site, or redirects there, that site is added to the waiting list. With
+  `--candidates` it is crawled in the same run; otherwise it waits.
 - **Common Crawl (`discover`).** Common Crawl publishes an index of billions of
   pages it has crawled. Apache listings have sort links like `?C=N;O=D`, so their
   URLs stand out in the index. `discover` downloads only the parts of the index
@@ -56,8 +56,8 @@ The crawler only visits sites it has been given. Discovery adds more, as
 # Scan 10 of the ~300 index files of the latest crawl (runs resume where they stopped).
 .\target\release\opendir.exe discover --files 10
 
-# Crawl the sites found so far (up to 1000 per round), following new links for 3 rounds.
-.\target\release\opendir.exe crawl --candidates --rounds 3 --max-dirs 500
+# Crawl everything waiting, including sites found along the way, for up to 2 hours.
+.\target\release\opendir.exe crawl --candidates --hours 2
 
 .\target\release\opendir.exe stats
 ```
@@ -66,14 +66,66 @@ The discover progress line shows how much it downloaded. Try `--files 1` first t
 see what one index file costs on your connection. Use `--crawl CC-MAIN-2026-30` to
 pick a specific crawl instead of the latest.
 
+## Running every night (Windows)
+
+`opendir auto` is made for a scheduled task. Each run:
+
+1. adds the sites in `seeds\mirrors.txt` that were never crawled,
+2. scans 10 more Common Crawl index files (at most a quarter of the time; if Common
+   Crawl can't be reached, it just skips this),
+3. crawls the waiting sites until the time is up, including sites found that night,
+4. stops cleanly. Sites it didn't finish are marked `paused`, and the next run
+   carries on from where they stopped, without re-fetching what it already has.
+
+Each site also has a budget of 20,000 directories per run (`--max-dirs`). A bigger
+mirror is paused at that point and continues the next night, so one huge site
+can't take a whole night's slot.
+
+`nightly.bat` in the project folder runs `auto --hours 7` and appends its output to
+`logs\nightly.log`. Change the hours in it to fit your night. To set it up:
+
+1. Build once: `cargo build --release`.
+2. Try a 3-minute run to check everything works:
+   `.\target\release\opendir.exe auto --hours 0.05`
+3. Schedule it for every night at 23:30 (adjust the path and time):
+
+   ```
+   schtasks /Create /TN "opendir nightly" /TR "D:\opendirtest\nightly.bat" /SC DAILY /ST 23:30
+   ```
+
+4. Keep the PC from sleeping at night: in Windows Settings, go to System, then
+   Power, and set sleep to *Never* when plugged in. Or open Task Scheduler, find
+   "opendir nightly", and under **Conditions** tick *Wake the computer to run this
+   task*. Under **Settings**, *Run task as soon as possible after a scheduled start
+   is missed* covers nights when the PC was off.
+
+Useful commands: `schtasks /Run /TN "opendir nightly"` starts it now, and
+`schtasks /Delete /TN "opendir nightly" /F` removes it. The task as created runs
+while you are logged in (a locked screen is fine). To run it when logged out, open
+the task in Task Scheduler and choose *Run whether user is logged on or not*.
+
+During the day, browse the results with `opendir search`, `opendir stats`, or a
+database browser (see below). If you use DB Browser for SQLite while a run is going,
+open the database read-only.
+
+## Browsing the database
+
+- `opendir search <words>` and `opendir stats` from the command line.
+- [DB Browser for SQLite](https://sqlitebrowser.org/dl/): open `opendir.db` and use
+  *Browse Data* on the `entries` and `hosts` tables.
+- [Datasette](https://datasette.io/) (needs Python): `pip install datasette`, then
+  `datasette opendir.db` and open http://127.0.0.1:8001 for search and filters.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `crawl [URL...] [--seeds FILE] [--candidates]` | Crawls the given directory URLs, and with `--candidates` the discovered sites not crawled yet (`--hosts` per round, default 1000; `--rounds`, default 1). Options: `--db` (default `opendir.db`), `--concurrency` (sites crawled at once, default 256), `--max-dirs` (directory budget per site, default 20000), `--max-depth` (default 32), `--optout` (default `lists/optout.txt`). |
+| `auto` | The nightly job described above. Options: `--hours` (default 7), `--seeds` (default `seeds/mirrors.txt`), `--discover-files` (default 10, 0 to skip), `--crawl`, `--db`, and the crawl options below. |
+| `crawl [URL...] [--seeds FILE] [--candidates]` | Crawls the given directory URLs, and with `--candidates` every site waiting in the database (found by discovery, or paused). Options: `--hours` (time limit), `--max-sites` (sites to take from the waiting list), `--db` (default `opendir.db`), `--concurrency` (sites crawled at once, default 256), `--max-dirs` (directory budget per site per run, default 20000), `--max-depth` (default 32), `--optout` (default `lists/optout.txt`). |
 | `discover` | Finds listings in the Common Crawl index. Options: `--crawl` (default `latest`), `--files` (index files this run, default 10), `--parallel` (default 4), `--db`. |
 | `search WORDS...` | Full-text search over file and folder names. Options: `--ext iso`, `-n 50`, `--unfiltered` (show results the piracy filter hides), `--takedown` (default `lists/takedown.txt`). |
-| `stats` | Sites per crawl status with file counts and total size, discovery candidates, and why any site was dropped as sensitive. |
+| `stats` | Sites per crawl status with file counts and total size, what is waiting to be crawled, and why any site was dropped as sensitive. |
+| `forget SITE...` | Removes everything known about a site, so it is crawled or re-checked from scratch the next time it is in the seeds or found again. |
 
 Everything lives in one SQLite file (`opendir.db`), so you can also query it with any
 SQLite tool.
@@ -125,7 +177,8 @@ issue with the URLs; they go into [`lists/takedown.txt`](lists/takedown.txt).
 
 - Common Crawl discovery recognises Apache and nginx-fancyindex listings (they have sort
   links). Plain nginx listings are found only through seeds and links.
-- Sites are crawled round by round: a round ends when its slowest site finishes.
+- Sites that failed with too many errors (`partial`) or were unreachable are not retried
+  automatically; use `forget` to retry one.
 - A new crawl re-fetches everything. Entries that disappeared from a site stay in the
   database until you delete the database file.
 - Dates are stored as the server shows them, with no time zone.

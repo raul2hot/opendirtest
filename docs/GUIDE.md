@@ -508,6 +508,8 @@ Gbit/s.
 - Discovery covers the Common Crawl sort-link query (§3.1, as `opendir discover`, reading
   the Parquet index with HTTP range requests instead of DuckDB) and link expansion
   (§3.6, including cross-site redirects). Censys/Shodan and CT logs are not built.
+- Crawls are resumable: a time limit or the per-run directory budget pauses a host
+  and saves its frontier as candidates, and `opendir auto` chains nightly runs.
 - There are no trust tiers yet (§6.1). Every verified host is handled like tier 1.
 - The `ls-lR` shortcut and mtime-guided recrawl are next.
 

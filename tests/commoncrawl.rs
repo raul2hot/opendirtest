@@ -170,10 +170,10 @@ async fn finds_listings_reading_only_a_fraction_of_the_index() {
     assert_eq!(stats.files_failed.load(Relaxed), 0);
 
     let conn = store::open(&db).unwrap();
-    let mut found: Vec<String> = store::pending_candidates(&conn, 100)
+    let mut found: Vec<String> = store::pending_hosts(&conn, 100, &HashSet::new())
         .unwrap()
         .into_iter()
-        .map(String::from)
+        .flat_map(|(_, urls)| urls.into_iter().map(String::from))
         .collect();
     found.sort();
     // `/pub/linux/` is dropped because its parent `/pub/` is also a candidate.

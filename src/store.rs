@@ -5,6 +5,7 @@
 //! The crawler never touches SQLite directly. It sends messages to a single
 //! writer thread, which batches them into transactions.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +13,7 @@ use anyhow::{Context as _, Result, bail};
 use percent_encoding::percent_decode_str;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, params};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
 use crate::filters;
@@ -60,7 +61,8 @@ CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
     INSERT INTO entries_fts(rowid, name, dir) VALUES (new.rowid, new.name, new.dir);
 END;
 
--- Directory URLs found by discovery. A host is pending until it appears in `hosts`.
+-- Work still to do: directory URLs to crawl, found by discovery or saved when a
+-- crawl was paused. A host's rows are removed once it is finished.
 CREATE TABLE IF NOT EXISTS candidates (
     url      TEXT PRIMARY KEY,
     host     TEXT NOT NULL,
@@ -82,7 +84,10 @@ CREATE TABLE IF NOT EXISTS cc_files (
 pub enum HostStatus {
     /// Every reachable directory was crawled.
     Done,
-    /// Stopped early: directory budget reached, Ctrl-C, or too many errors.
+    /// Stopped by the time limit, Ctrl-C or the per-run directory budget. The
+    /// directories still to do are saved as candidates; the next run continues.
+    Paused,
+    /// Given up after too many errors in a row.
     Partial,
     RobotsDisallowed,
     NotListing,
@@ -95,6 +100,7 @@ impl HostStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             HostStatus::Done => "done",
+            HostStatus::Paused => "paused",
             HostStatus::Partial => "partial",
             HostStatus::RobotsDisallowed => "robots_disallowed",
             HostStatus::NotListing => "not_listing",
@@ -127,12 +133,24 @@ pub enum Msg {
         urls: Vec<Url>,
         source: String,
     },
+    /// A crawl stopped before finishing: the candidates it started from are
+    /// done, and `frontier` is what is left to crawl next time.
+    Paused {
+        host: String,
+        finished: Vec<Url>,
+        frontier: Vec<Url>,
+    },
     /// A Common Crawl index file has been fully scanned.
     CcFileDone {
         path: String,
         candidates: u64,
     },
+    /// Replies once everything sent before it is committed.
+    Flush(oneshot::Sender<()>),
 }
+
+/// `candidates.source` for directories saved by a paused crawl.
+pub const RESUME_SOURCE: &str = "resume";
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -182,11 +200,17 @@ pub fn spawn_writer(
         while let Some(first) = rx.blocking_recv() {
             let txn = conn.transaction()?;
             // A failing statement only undoes itself; log it and keep the rest of the batch.
+            let mut flushes = Vec::new();
             let mut next = Some(first);
             let mut batched = 0;
             while let Some(msg) = next.take() {
-                if let Err(e) = apply(&txn, msg) {
-                    eprintln!("database: skipped one update: {e:#}");
+                match msg {
+                    Msg::Flush(reply) => flushes.push(reply),
+                    msg => {
+                        if let Err(e) = apply(&txn, msg) {
+                            eprintln!("database: skipped one update: {e:#}");
+                        }
+                    }
                 }
                 batched += 1;
                 // Batch whatever else is already queued into the same transaction.
@@ -195,6 +219,9 @@ pub fn spawn_writer(
                 }
             }
             txn.commit().context("committing to the database")?;
+            for reply in flushes {
+                let _ = reply.send(());
+            }
         }
         Ok(())
     });
@@ -244,21 +271,37 @@ fn apply(conn: &Connection, msg: Msg) -> Result<()> {
                  FROM entries WHERE host = ?1 AND is_dir = 0
                  ON CONFLICT(host) DO UPDATE SET
                     status = excluded.status, server = coalesce(excluded.server, hosts.server),
-                    dirs = excluded.dirs, files = excluded.files, bytes = excluded.bytes,
+                    dirs = excluded.dirs
+                        + CASE WHEN hosts.status = 'paused' THEN hosts.dirs ELSE 0 END,
+                    files = excluded.files, bytes = excluded.bytes,
                     crawled_at = excluded.crawled_at, reason = excluded.reason",
                 params![host, status.as_str(), server, dirs as i64, now, reason],
             )?;
-        }
-        Msg::Candidates { urls, source } => {
-            let mut stmt = conn.prepare_cached(
-                "INSERT OR IGNORE INTO candidates (url, host, source, found_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for url in urls {
-                if let Some(host) = url.host_str() {
-                    stmt.execute(params![url.as_str(), host, source, now])?;
-                }
+            if status != HostStatus::Paused {
+                conn.execute("DELETE FROM candidates WHERE host = ?1", [&host])?;
             }
+        }
+        Msg::Candidates { urls, source } => insert_candidates(conn, &urls, &source, now)?,
+        Msg::Paused {
+            host,
+            finished,
+            frontier,
+        } => {
+            // Keep only the saved frontier (plus directories saved past the budget
+            // during this run): a seed or link URL higher up the tree would make
+            // the next run start over from the top.
+            conn.execute(
+                "DELETE FROM candidates WHERE host = ?1 AND source != ?2",
+                params![host, RESUME_SOURCE],
+            )?;
+            let mut stmt = conn.prepare_cached("DELETE FROM candidates WHERE url = ?1")?;
+            for url in finished {
+                stmt.execute([url.as_str()])?;
+            }
+            insert_candidates(conn, &frontier, RESUME_SOURCE, now)?;
+        }
+        Msg::Flush(reply) => {
+            let _ = reply.send(());
         }
         Msg::CcFileDone { path, candidates } => {
             conn.execute(
@@ -271,44 +314,88 @@ fn apply(conn: &Connection, msg: Msg) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Discovery candidates
+// Candidates: work still to do
 // ---------------------------------------------------------------------------
 
-/// Seed URLs for up to `max_hosts` hosts that have candidates but were never
-/// crawled, oldest first. Within a host, a URL is dropped when one of its
-/// ancestor directories is also a candidate, since the crawl reaches it anyway.
-pub fn pending_candidates(conn: &Connection, max_hosts: usize) -> Result<Vec<Url>> {
-    let mut stmt = conn.prepare(
-        "SELECT url FROM candidates WHERE host IN (
-             SELECT host FROM candidates
-             WHERE host NOT IN (SELECT host FROM hosts)
-             GROUP BY host ORDER BY min(found_at), host LIMIT ?1)
+/// Adds directory URLs to crawl for hosts never crawled before. Hosts already
+/// in `hosts` are ignored, paused ones included: they continue from their
+/// saved frontier instead.
+pub fn add_candidates(conn: &Connection, urls: &[Url], source: &str) -> Result<()> {
+    insert_candidates(conn, urls, source, unix_now())
+}
+
+fn insert_candidates(conn: &Connection, urls: &[Url], source: &str, now: i64) -> Result<()> {
+    // A frontier may be saved for a host that is running or paused; anything
+    // else only for hosts never crawled.
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO candidates (url, host, source, found_at)
+         SELECT ?1, ?2, ?3, ?4
+         WHERE NOT EXISTS (
+             SELECT 1 FROM hosts WHERE host = ?2 AND (?3 != 'resume' OR status != 'paused'))",
+    )?;
+    for url in urls {
+        if let Some(host) = url.host_str() {
+            stmt.execute(params![url.as_str(), host, source, now])?;
+        }
+    }
+    Ok(())
+}
+
+/// Up to `want` hosts with work to do, oldest first, skipping `exclude` (hosts
+/// already being crawled). Each comes with its seed URLs; a URL is dropped when
+/// one of its ancestor directories is also a seed, since the crawl reaches it.
+pub fn pending_hosts(
+    conn: &Connection,
+    want: usize,
+    exclude: &HashSet<String>,
+) -> Result<Vec<(String, Vec<Url>)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT host, url FROM candidates WHERE host IN (
+             SELECT c.host FROM candidates c
+             WHERE NOT EXISTS (SELECT 1 FROM hosts h WHERE h.host = c.host AND h.status != 'paused')
+             GROUP BY c.host ORDER BY min(c.found_at), c.host LIMIT ?1)
          ORDER BY host, length(url), url",
     )?;
-    let urls: Vec<String> = stmt
-        .query_map([max_hosts as i64], |row| row.get(0))?
+    let limit = (want + exclude.len()) as i64;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut seeds: Vec<Url> = Vec::new();
+    let mut hosts: Vec<(String, Vec<Url>)> = Vec::new();
     let mut kept: Vec<String> = Vec::new();
-    let mut current_host = String::new();
-    for raw in urls {
-        let Ok(url) = Url::parse(&raw) else { continue };
-        let host = url.host_str().unwrap_or("").to_string();
-        if host != current_host {
-            kept.clear();
-            current_host = host;
+    for (host, raw) in rows {
+        if exclude.contains(&host) {
+            continue;
         }
+        if hosts.last().is_none_or(|(h, _)| *h != host) {
+            if hosts.len() == want {
+                break;
+            }
+            hosts.push((host, Vec::new()));
+            kept.clear();
+        }
+        let Ok(url) = Url::parse(&raw) else { continue };
         // Shorter URLs come first, so any ancestor is already in `kept`.
         if !kept
             .iter()
             .any(|ancestor| raw.starts_with(ancestor.as_str()))
         {
             kept.push(raw);
-            seeds.push(url);
+            if let Some((_, seeds)) = hosts.last_mut() {
+                seeds.push(url);
+            }
         }
     }
-    Ok(seeds)
+    Ok(hosts)
+}
+
+/// Removes everything known about a host (crawl result, entries, candidates),
+/// so it can be crawled or re-checked from scratch. Returns false if unknown.
+pub fn forget(conn: &Connection, host: &str) -> Result<bool> {
+    let mut known = conn.execute("DELETE FROM hosts WHERE host = ?1", [host])? > 0;
+    known |= conn.execute("DELETE FROM entries WHERE host = ?1", [host])? > 0;
+    known |= conn.execute("DELETE FROM candidates WHERE host = ?1", [host])? > 0;
+    Ok(known)
 }
 
 /// Common Crawl index files that were already scanned completely.
@@ -416,17 +503,16 @@ pub struct StatusCount {
     pub bytes: u64,
 }
 
+/// Work still to do, per source.
 pub struct CandidateCount {
     pub source: String,
     pub urls: u64,
     pub hosts: u64,
-    pub pending_hosts: u64,
 }
 
 pub fn candidate_stats(conn: &Connection) -> Result<Vec<CandidateCount>> {
     let mut stmt = conn.prepare(
-        "SELECT source, count(*), count(DISTINCT host),
-                count(DISTINCT CASE WHEN host NOT IN (SELECT host FROM hosts) THEN host END)
+        "SELECT source, count(*), count(DISTINCT host)
          FROM candidates GROUP BY source ORDER BY source",
     )?;
     let rows = stmt
@@ -435,7 +521,6 @@ pub fn candidate_stats(conn: &Connection) -> Result<Vec<CandidateCount>> {
                 source: row.get(0)?,
                 urls: row.get::<_, i64>(1)? as u64,
                 hosts: row.get::<_, i64>(2)? as u64,
-                pending_hosts: row.get::<_, i64>(3)? as u64,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -537,24 +622,103 @@ mod tests {
         };
         apply(&conn, done).unwrap();
 
-        let pending: Vec<String> = pending_candidates(&conn, 10)
-            .unwrap()
-            .into_iter()
-            .map(String::from)
+        let none = HashSet::new();
+        let pending = pending_hosts(&conn, 10, &none).unwrap();
+        let urls: Vec<String> = pending
+            .iter()
+            .flat_map(|(_, u)| u.iter().map(Url::to_string))
             .collect();
         assert_eq!(
-            pending,
+            urls,
             vec![
                 "https://a.example/pub/",
                 "https://a.example/data/",
                 "https://b.example/files/"
             ]
         );
+        // The finished host's candidates were removed when it finished.
+        let left: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM candidates WHERE host = 'done.example'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+
+        let one = pending_hosts(&conn, 1, &none).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0, "a.example");
+        let busy: HashSet<String> = ["a.example".to_string()].into();
+        let others = pending_hosts(&conn, 10, &busy).unwrap();
+        assert_eq!(others.len(), 1);
+        assert_eq!(others[0].0, "b.example");
+
+        // Candidates for a finished host are ignored.
+        let late = [Url::parse("https://done.example/new/").unwrap()];
+        add_candidates(&conn, &late, "link").unwrap();
+        let hosts = pending_hosts(&conn, 10, &none).unwrap();
+        assert!(hosts.iter().all(|(h, _)| h != "done.example"));
+    }
+
+    #[test]
+    fn paused_hosts_resume_from_their_frontier() {
+        let conn = open(&temp_path("paused")).unwrap();
+        let url = |u: &str| Url::parse(u).unwrap();
+        add_candidates(&conn, &[url("https://m.example/pub/")], "seed").unwrap();
+        let paused = Msg::Paused {
+            host: "m.example".into(),
+            finished: vec![url("https://m.example/pub/")],
+            frontier: vec![
+                url("https://m.example/pub/b/"),
+                url("https://m.example/pub/c/"),
+            ],
+        };
+        apply(&conn, paused).unwrap();
+        let status = Msg::HostDone {
+            host: "m.example".into(),
+            status: HostStatus::Paused,
+            server: None,
+            dirs: 3,
+            reason: None,
+        };
+        apply(&conn, status).unwrap();
+
+        let pending = pending_hosts(&conn, 10, &HashSet::new()).unwrap();
+        let urls: Vec<&str> = pending[0].1.iter().map(Url::as_str).collect();
         assert_eq!(
-            pending_candidates(&conn, 1).unwrap().len(),
-            2,
-            "one host: a.example"
+            urls,
+            vec!["https://m.example/pub/b/", "https://m.example/pub/c/"]
         );
+
+        // Re-adding the seed (as `auto` does every night) must not restart the walk.
+        add_candidates(&conn, &[url("https://m.example/pub/")], "seed").unwrap();
+        let pending = pending_hosts(&conn, 10, &HashSet::new()).unwrap();
+        assert_eq!(pending[0].1.len(), 2);
+
+        // The next run finishes it; directory counts add up across runs.
+        let done = Msg::HostDone {
+            host: "m.example".into(),
+            status: HostStatus::Done,
+            server: None,
+            dirs: 2,
+            reason: None,
+        };
+        apply(&conn, done).unwrap();
+        let dirs: i64 = conn
+            .query_row("SELECT dirs FROM hosts WHERE host = 'm.example'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dirs, 5);
+
+        assert!(forget(&conn, "m.example").unwrap());
+        assert!(
+            pending_hosts(&conn, 10, &HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!forget(&conn, "m.example").unwrap());
     }
 
     #[test]

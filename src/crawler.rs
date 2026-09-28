@@ -5,6 +5,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
@@ -13,7 +14,7 @@ use anyhow::Result;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode};
 use texting_robots::Robot;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -25,7 +26,7 @@ use crate::safety::{
     DROP_SENSITIVE_EXPOSURES, ENFORCE_PER_HOST_RATE_LIMIT, FOLLOW_LISTED_LINKS_ONLY,
     HONOR_OPT_OUT_LIST, RESPECT_ROBOTS_TXT, SEND_IDENTIFYING_USER_AGENT,
 };
-use crate::store::{HostStatus, Msg};
+use crate::store::{self, HostStatus, Msg, RESUME_SOURCE};
 
 /// Product token matched against `User-agent:` lines in robots.txt.
 pub const BOT_TOKEN: &str = "opendirtest";
@@ -49,6 +50,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// Hosts asking for a longer Crawl-delay than this are skipped rather than
 /// holding a crawl slot for days.
 const MAX_CRAWL_DELAY: Duration = Duration::from_secs(60);
+/// Directories past the per-run budget saved for the next run, at most (per host).
+const MAX_SAVED_OVERFLOW: usize = 50_000;
+/// How often the scheduler looks for newly found sites while slots are free.
+const POLL_EVERY: Duration = Duration::from_secs(2);
 
 pub struct CrawlConfig {
     /// Hosts crawled at the same time.
@@ -88,18 +93,107 @@ pub struct Stats {
     pub errors: AtomicU64,
 }
 
-/// Crawls every seed, grouped by host. Returns when all hosts are finished, or
-/// soon after `stop` is cancelled. Hosts that were stopped before their first
-/// listing are not recorded, so they stay pending for the next run.
+/// Hosts waiting in the database (the `candidates` table).
+pub struct Pending {
+    pub db: PathBuf,
+    /// Take at most this many hosts in this run (`None`: no limit).
+    pub max_hosts: Option<usize>,
+}
+
+/// Crawls the seeds, grouped by host, and then, with `pending`, the hosts
+/// waiting in the database. The database is re-read as slots free up, so sites
+/// found during the run are crawled in the same run.
+///
+/// Returns when nothing is left, or soon after `stop` is cancelled. Hosts that
+/// were running then are recorded as paused, with what is left of their crawl
+/// saved for the next run.
 pub async fn crawl(
     seeds: Vec<Url>,
+    pending: Option<Pending>,
     cfg: CrawlConfig,
     tx: mpsc::Sender<Msg>,
     stop: CancellationToken,
     stats: Arc<Stats>,
 ) -> Result<()> {
     let client = build_client()?;
+    let mut ready: VecDeque<(String, Vec<Url>)> = group_by_host(seeds).into();
+    let source = match &pending {
+        Some(p) => Some(store::open(&p.db)?),
+        None => None,
+    };
+    let max_hosts = pending.and_then(|p| p.max_hosts).unwrap_or(usize::MAX);
 
+    let cfg = Arc::new(cfg);
+    let slots = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
+    let mut tasks = JoinSet::new();
+    // Every host started in this run; they are never started twice.
+    let mut dispatched: HashSet<String> = HashSet::new();
+    let mut taken = 0;
+    let mut last_poll: Option<Instant> = None;
+
+    loop {
+        if stop.is_cancelled() {
+            break;
+        }
+        let free = slots.available_permits();
+        let due = tasks.is_empty() || last_poll.is_none_or(|t| t.elapsed() >= POLL_EVERY);
+        let want = free.min(max_hosts - taken);
+        if ready.is_empty() && source.is_some() && due && want > 0 {
+            // Commit what finished hosts found, so the query sees it.
+            flush(&tx).await;
+            if let Some(conn) = &source {
+                let batch = store::pending_hosts(conn, want, &dispatched)?;
+                taken += batch.len();
+                ready.extend(batch);
+            }
+            last_poll = Some(Instant::now());
+        }
+
+        match ready.pop_front() {
+            Some((host, seeds)) => {
+                if !dispatched.insert(host.clone()) {
+                    continue;
+                }
+                let permit = tokio::select! {
+                    permit = slots.clone().acquire_owned() => permit?,
+                    _ = stop.cancelled() => break,
+                };
+                stats.hosts_total.fetch_add(1, Relaxed);
+                let worker = HostCrawl {
+                    host,
+                    client: client.clone(),
+                    pacer: Pacer::new(cfg.per_host_delay),
+                    cfg: cfg.clone(),
+                    tx: tx.clone(),
+                    stop: stop.clone(),
+                    stats: stats.clone(),
+                    robots: HashMap::new(),
+                    robots_blocked: None,
+                    last_error: None,
+                };
+                tasks.spawn(async move {
+                    worker.run(seeds).await;
+                    drop(permit);
+                });
+                continue;
+            }
+            // Nothing queued, nothing running, and the database had nothing new.
+            None if tasks.is_empty() => break,
+            None => {}
+        }
+        tokio::select! {
+            Some(result) = tasks.join_next() => report_panic(result),
+            _ = tokio::time::sleep(POLL_EVERY) => {}
+            _ = stop.cancelled() => break,
+        }
+    }
+    while let Some(result) = tasks.join_next().await {
+        report_panic(result);
+    }
+    Ok(())
+}
+
+fn group_by_host(seeds: Vec<Url>) -> Vec<(String, Vec<Url>)> {
     let mut hosts: Vec<(String, Vec<Url>)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for seed in seeds {
@@ -112,40 +206,15 @@ pub async fn crawl(
         });
         hosts[i].1.push(seed);
     }
-    stats.hosts_total.store(hosts.len() as u64, Relaxed);
+    hosts
+}
 
-    let cfg = Arc::new(cfg);
-    let slots = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
-    let mut tasks = JoinSet::new();
-    for (host, seeds) in hosts {
-        let permit = tokio::select! {
-            permit = slots.clone().acquire_owned() => permit?,
-            _ = stop.cancelled() => break,
-        };
-        let worker = HostCrawl {
-            host,
-            client: client.clone(),
-            pacer: Pacer::new(cfg.per_host_delay),
-            cfg: cfg.clone(),
-            tx: tx.clone(),
-            stop: stop.clone(),
-            stats: stats.clone(),
-            robots: HashMap::new(),
-            robots_blocked: None,
-            last_error: None,
-        };
-        tasks.spawn(async move {
-            worker.run(seeds).await;
-            drop(permit);
-        });
-        while let Some(result) = tasks.try_join_next() {
-            report_panic(result);
-        }
+/// Waits until the database writer has committed everything sent so far.
+async fn flush(tx: &mpsc::Sender<Msg>) {
+    let (reply, committed) = oneshot::channel();
+    if tx.send(Msg::Flush(reply)).await.is_ok() {
+        let _ = committed.await;
     }
-    while let Some(result) = tasks.join_next().await {
-        report_panic(result);
-    }
-    Ok(())
 }
 
 fn report_panic(result: Result<(), tokio::task::JoinError>) {
@@ -304,25 +373,26 @@ impl HostCrawl {
             return None; // keeps the reason recorded when it was dropped
         }
 
+        let started_from = seeds.clone();
         let mut queue: VecDeque<(Url, usize)> = seeds.into_iter().map(|u| (u, 0)).collect();
         let mut seen: HashSet<String> = queue.iter().map(|(u, _)| u.to_string()).collect();
         let mut listing_hashes = HashSet::new();
         let mut server = None;
         let mut dirs = 0u64;
         let mut stopped = false;
-        let mut truncated: Option<String> = None;
+        let mut budget_reached = false;
+        let mut overflow_saved = 0;
+        let mut gave_up: Option<String> = None;
         let mut errors_in_a_row = 0;
 
         while let Some((url, depth)) = queue.pop_front() {
-            if self.stop.is_cancelled() {
-                stopped = true;
+            if self.stop.is_cancelled() || dirs >= self.cfg.max_dirs_per_host {
+                stopped = self.stop.is_cancelled();
+                budget_reached = !stopped;
+                queue.push_front((url, depth));
                 break;
             }
-            if dirs >= self.cfg.max_dirs_per_host {
-                truncated = Some("directory budget reached".into());
-                break;
-            }
-            let page = match self.fetch_page(url).await {
+            let page = match self.fetch_page(url.clone()).await {
                 Fetch::Page(page) => page,
                 Fetch::Skipped => {
                     errors_in_a_row = 0;
@@ -330,19 +400,18 @@ impl HostCrawl {
                 }
                 Fetch::Stopped => {
                     stopped = true;
+                    queue.push_front((url, depth));
                     break;
                 }
                 Fetch::Failed(error) => {
                     self.stats.errors.fetch_add(1, Relaxed);
-                    self.last_error = Some(error);
                     errors_in_a_row += 1;
                     if errors_in_a_row >= MAX_CONSECUTIVE_ERRORS {
-                        truncated = Some(format!(
-                            "too many errors, last: {}",
-                            self.last_error.as_deref().unwrap_or("")
-                        ));
+                        gave_up = Some(format!("too many errors, last: {error}"));
+                        self.last_error = Some(error);
                         break;
                     }
+                    self.last_error = Some(error);
                     continue;
                 }
             };
@@ -397,18 +466,30 @@ impl HostCrawl {
                 if !FOLLOW_LISTED_LINKS_ONLY {
                     next.extend(other_dirs);
                 }
+                // Past this run's budget, directories go to the database for the
+                // next run instead of into memory.
+                let mut overflow = Vec::new();
                 for dir in next {
-                    if queue.len() as u64 + dirs >= self.cfg.max_dirs_per_host {
-                        truncated = Some("directory budget reached".into());
-                        break;
-                    }
                     if depth < self.cfg.max_depth
                         && dir.as_str().len() <= MAX_URL_LEN
                         && !has_repeating_segments(dir.path())
                         && seen.insert(dir.to_string())
                     {
-                        queue.push_back((dir, depth + 1));
+                        if queue.len() as u64 + dirs < self.cfg.max_dirs_per_host {
+                            queue.push_back((dir, depth + 1));
+                        } else if overflow_saved < MAX_SAVED_OVERFLOW {
+                            overflow_saved += 1;
+                            overflow.push(dir);
+                        }
                     }
+                }
+                if !overflow.is_empty() {
+                    budget_reached = true;
+                    let msg = Msg::Candidates {
+                        urls: overflow,
+                        source: RESUME_SOURCE.to_string(),
+                    };
+                    let _ = self.tx.send(msg).await;
                 }
             }
 
@@ -426,16 +507,30 @@ impl HostCrawl {
         }
 
         if stopped && dirs == 0 {
-            return None; // try this host again next time
+            return None; // untouched: its candidates stay for the next run
         }
+        let unfinished = (stopped || budget_reached) && (!queue.is_empty() || overflow_saved > 0);
         let (status, reason) = match dirs {
             0 if self.robots_blocked.is_some() => {
                 (HostStatus::RobotsDisallowed, self.robots_blocked.take())
             }
             0 if self.last_error.is_some() => (HostStatus::Unreachable, self.last_error.take()),
             0 => (HostStatus::NotListing, None),
-            _ if stopped => (HostStatus::Partial, Some("stopped".to_string())),
-            _ if truncated.is_some() => (HostStatus::Partial, truncated),
+            _ if gave_up.is_some() => (HostStatus::Partial, gave_up),
+            _ if unfinished => {
+                let msg = Msg::Paused {
+                    host: self.host.clone(),
+                    finished: started_from,
+                    frontier: queue.into_iter().map(|(url, _)| url).collect(),
+                };
+                let _ = self.tx.send(msg).await;
+                let why = if stopped {
+                    "stopped; continues next run"
+                } else {
+                    "directory budget for this run reached; continues next run"
+                };
+                (HostStatus::Paused, Some(why.to_string()))
+            }
             _ => (HostStatus::Done, None),
         };
         Some(Report {

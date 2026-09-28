@@ -1,0 +1,2 @@
+# URL prefixes hidden from search results after a takedown or deletion request.
+# One prefix per line (HONOR_TAKEDOWN_LIST).

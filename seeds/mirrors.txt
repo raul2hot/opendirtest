@@ -1,0 +1,17 @@
+# Official software mirrors and public data archives: legal and usually autoindexed.
+# One directory URL per line. The crawler still checks robots.txt for each host
+# and skips anything that is not a directory listing, so a stale entry is harmless.
+https://archive.ubuntu.com/ubuntu/
+https://deb.debian.org/debian/
+https://dl.fedoraproject.org/pub/
+https://mirrors.kernel.org/
+https://cdn.kernel.org/pub/
+https://ftp.gnu.org/gnu/
+https://download.savannah.gnu.org/releases/
+https://ftp.osuosl.org/pub/
+https://mirrors.mit.edu/
+https://ftp.funet.fi/pub/
+https://ftp.ncbi.nlm.nih.gov/
+https://cran.r-project.org/src/contrib/
+https://www.ncei.noaa.gov/data/
+https://ftp.mozilla.org/pub/

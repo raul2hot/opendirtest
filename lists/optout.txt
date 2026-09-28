@@ -1,0 +1,2 @@
+# Site owners who asked not to be crawled. One domain per line; a domain also
+# covers its subdomains. Checked before any request is sent (HONOR_OPT_OUT_LIST).

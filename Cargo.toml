@@ -4,5 +4,24 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 publish = false
+description = "Fast, polite indexer for public open directories"
+
+[[bin]]
+name = "opendir"
+path = "src/main.rs"
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+percent-encoding = "2"
+regex = "1"
+reqwest = { version = "0.13", features = ["gzip", "brotli", "zstd"] }
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+texting_robots = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros"] }

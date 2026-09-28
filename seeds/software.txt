@@ -25,4 +25,4 @@ https://cache.ruby-lang.org/pub/ruby/
 https://download.qemu.org/
 https://sourceware.org/pub/
 https://ftp.x.org/pub/
-https://archive.apache.org/dist/
+# archive.apache.org is left out: its robots.txt only admits bots it has approved.

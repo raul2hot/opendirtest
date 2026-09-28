@@ -496,8 +496,13 @@ fn clean_stored(conn: &mut rusqlite::Connection, cfg: &CrawlConfig) -> Result<bo
         skip: &cfg.skip,
         quality: cfg.quality,
     };
+    eprintln!("Checking what is stored against the current rules...");
     let report = store::clean(conn, &rules)?;
     print_clean_report(&report);
+    // About 40 MB of freed pages is worth rewriting the file for.
+    if store::compact_if_wasteful(conn, 10_000)? {
+        eprintln!("Compacted the database file (freed space returned to disk).");
+    }
     Ok(!report.is_empty())
 }
 

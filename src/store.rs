@@ -756,6 +756,19 @@ pub fn clean(conn: &mut Connection, rules: &CleanRules) -> Result<CleanReport> {
     Ok(report)
 }
 
+/// Rewrites the database file without the space freed by deleted rows, if that
+/// is a lot: at least `min_free_pages` pages and a quarter of the file. SQLite
+/// otherwise keeps the file as big as it ever was. Returns whether it did.
+pub fn compact_if_wasteful(conn: &Connection, min_free_pages: i64) -> Result<bool> {
+    let free: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    let total: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    if free < min_free_pages || free * 4 < total {
+        return Ok(false);
+    }
+    conn.execute_batch("VACUUM")?;
+    Ok(true)
+}
+
 /// Sites with a strong sensitive name or folder are dropped; a weak name drops
 /// a site you did not add yourself, and only the entry on one you did.
 fn apply_sensitive(conn: &Connection) -> Result<(Vec<(String, String)>, usize)> {
@@ -1411,6 +1424,56 @@ mod tests {
 
         // A second pass finds nothing more to do.
         assert!(clean(&mut conn, &rules).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_file_shrinks_after_a_big_cleanup() {
+        let path = temp_path("compact");
+        let mut conn = open(&path).unwrap();
+        for host in 0..40 {
+            let photos = photos(300);
+            let photos: Vec<(&str, Option<u64>)> =
+                photos.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+            add_site(
+                &conn,
+                &format!("junk{host}.example"),
+                "pics",
+                &photos,
+                false,
+                None,
+            );
+        }
+        let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let before = size(&path);
+        assert!(
+            !compact_if_wasteful(&conn, 10).unwrap(),
+            "nothing to reclaim yet"
+        );
+
+        let rules = CleanRules {
+            optout: &[],
+            skip: &filters::SkipList::default(),
+            quality: Thresholds::default(),
+        };
+        assert_eq!(clean(&mut conn, &rules).unwrap().low_value.len(), 40);
+        assert!(compact_if_wasteful(&conn, 10).unwrap());
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let after = size(&path);
+        assert!(after * 3 < before, "{before} -> {after} bytes");
+        // Still usable afterwards.
+        assert_eq!(status(&conn, "junk0.example"), "low_value");
+        add_site(
+            &conn,
+            "new.example",
+            "d",
+            &[("a.iso", Some(50_000_000))],
+            true,
+            None,
+        );
+        assert_eq!(hits(&conn, "iso"), 1);
     }
 
     #[test]

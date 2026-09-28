@@ -104,6 +104,17 @@ async fn fake_common_crawl() -> (common::Server, usize) {
             "https://deb.example.edu/ubuntu/pool/main/?C=M;O=A",
             "C=M;O=A",
         ),
+        // Website internals: nothing suggests a public archive.
+        (
+            185_000,
+            "https://blog.example.com/wp-content/uploads/2020/?C=N;O=D",
+            "C=N;O=D",
+        ),
+        (
+            185_001,
+            "https://random.example.org/stuff/?C=M;O=A",
+            "C=M;O=A",
+        ),
         // Sort-like query on a page that is not a directory: ignored.
         (
             170_501,
@@ -175,12 +186,14 @@ async fn finds_listings_reading_only_a_fraction_of_the_index() {
     assert_eq!(summary.files_left, 0);
     assert_eq!(stats.files_done.load(Relaxed), 2);
     assert_eq!(stats.files_failed.load(Relaxed), 0);
+    // Two listings show no sign of a public archive and are left out.
+    assert_eq!(stats.rejected.load(Relaxed), 2);
 
     let conn = store::open(&db).unwrap();
     let mut found: Vec<String> = store::pending_hosts(&conn, 100, &HashSet::new())
         .unwrap()
         .into_iter()
-        .flat_map(|(_, urls)| urls.into_iter().map(String::from))
+        .flat_map(|h| h.urls.into_iter().map(String::from))
         .collect();
     found.sort();
     assert_eq!(

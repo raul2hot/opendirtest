@@ -4,5 +4,6 @@ pub mod commoncrawl;
 pub mod crawler;
 pub mod filters;
 pub mod listing;
+pub mod quality;
 pub mod safety;
 pub mod store;

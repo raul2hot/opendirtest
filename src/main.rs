@@ -4,12 +4,14 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use opendirtest::commoncrawl::{self, DiscoverConfig, DiscoverStats, DiscoverSummary};
 use opendirtest::crawler::{self, CrawlConfig, Pending, Stats};
+use opendirtest::quality::Thresholds;
+use opendirtest::store::{CleanReport, CleanRules, SiteSort};
 use opendirtest::{filters, store};
 
 #[derive(Parser)]
@@ -30,8 +32,8 @@ enum Command {
         /// Stop after this many hours; unfinished sites continue next run
         #[arg(long, default_value_t = 7.0)]
         hours: f64,
-        /// Seed list; sites already crawled are skipped
-        #[arg(long, default_value = "seeds/mirrors.txt")]
+        /// Seed list: a file, or a folder whose *.txt files are all read
+        #[arg(long, default_value = "seeds")]
         seeds: PathBuf,
         /// Common Crawl index files to scan first (0 to skip discovery)
         #[arg(long, default_value_t = 10)]
@@ -48,7 +50,7 @@ enum Command {
     Crawl {
         /// Seed directory URLs
         urls: Vec<String>,
-        /// File with one seed URL per line (# starts a comment)
+        /// Seed list: a file, or a folder whose *.txt files are all read
         #[arg(long, short)]
         seeds: Option<PathBuf>,
         /// Also crawl the sites waiting in the database: found by discovery, or paused
@@ -81,6 +83,9 @@ enum Command {
         /// Skip list: finds in skipped folders only add the site's root
         #[arg(long, default_value = "lists/skip.txt")]
         skip: PathBuf,
+        /// Keep listings that show no sign of a public archive too
+        #[arg(long)]
+        broad: bool,
     },
     /// Search the index
     Search {
@@ -90,9 +95,12 @@ enum Command {
         db: PathBuf,
         #[arg(long, short = 'n', default_value_t = 20)]
         limit: usize,
-        /// Only files with this extension, e.g. `iso`
+        /// Only files with one of these extensions, e.g. `iso` or `mp3,flac`
         #[arg(long)]
         ext: Option<String>,
+        /// Only files at least this many MiB big
+        #[arg(long)]
+        min_mb: Option<u64>,
         /// Include results the likely-infringement filter would hide
         #[arg(long)]
         unfiltered: bool,
@@ -108,6 +116,26 @@ enum Command {
         #[arg(long, default_value = "opendir.db")]
         db: PathBuf,
     },
+    /// List sites: the biggest first, or those with a given status
+    Sites {
+        /// Only sites with this status: done, paused, not_listing, unreachable,
+        /// robots_disallowed, low_value, sensitive, skipped, opted_out, partial
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, value_enum, default_value_t = SortArg::Size)]
+        sort: SortArg,
+        #[arg(long, short = 'n', default_value_t = 40)]
+        limit: usize,
+        #[arg(long, default_value = "opendir.db")]
+        db: PathBuf,
+    },
+    /// Apply the current rules (opt-out, skip list, sensitive names, quality) to what is stored
+    Clean {
+        #[arg(long, default_value = "opendir.db")]
+        db: PathBuf,
+        #[command(flatten)]
+        crawl_args: CrawlArgs,
+    },
     /// Remove everything known about sites, so they are crawled or re-checked from scratch
     Forget {
         #[arg(required = true)]
@@ -115,6 +143,14 @@ enum Command {
         #[arg(long, default_value = "opendir.db")]
         db: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SortArg {
+    Size,
+    Files,
+    Recent,
+    Name,
 }
 
 #[derive(Args, Clone)]
@@ -133,6 +169,18 @@ struct CrawlArgs {
     /// Skip list: sites and folder patterns not to crawl
     #[arg(long, default_value = "lists/skip.txt")]
     skip: PathBuf,
+    /// Follow links to any directory, not only ones that look like a public archive
+    #[arg(long)]
+    broad: bool,
+    /// Drop a site you did not add unless it has at least this many big files (10 MiB+)...
+    #[arg(long, default_value_t = 3)]
+    min_big: u64,
+    /// ...or at least this many useful files (archives, disk images, documents, audio, video, data)
+    #[arg(long, default_value_t = 20)]
+    min_useful: u64,
+    /// Keep every site, even one with nothing useful
+    #[arg(long)]
+    keep_all: bool,
 }
 
 #[tokio::main]
@@ -179,9 +227,11 @@ async fn main() -> Result<()> {
             parallel,
             db,
             skip,
+            broad,
         } => {
             let skip = load_skip(&skip)?;
-            run_discover(crawl, files, parallel, skip, &db, stop_on_ctrl_c()).await?;
+            let stop = stop_on_ctrl_c();
+            run_discover(crawl, files, parallel, (skip, broad), &db, stop).await?;
             eprintln!("Next: opendir crawl --candidates --db {}", db.display());
             Ok(())
         }
@@ -190,6 +240,7 @@ async fn main() -> Result<()> {
             db,
             limit,
             ext,
+            min_mb,
             unfiltered,
             takedown,
             optout,
@@ -202,6 +253,7 @@ async fn main() -> Result<()> {
             let opts = store::SearchOptions {
                 limit,
                 ext,
+                min_bytes: min_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
                 unfiltered,
                 takedown,
                 optout: load_optout(&optout)?,
@@ -222,6 +274,20 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Stats { db } => print_stats(&db),
+        Command::Sites {
+            status,
+            sort,
+            limit,
+            db,
+        } => print_sites(&db, status.as_deref(), sort, limit),
+        Command::Clean { db, crawl_args } => {
+            let cfg = crawl_config(&crawl_args)?;
+            let mut conn = store::open_existing(&db)?;
+            if !clean_stored(&mut conn, &cfg)? {
+                println!("Nothing to clean: everything stored follows the current rules.");
+            }
+            Ok(())
+        }
         Command::Forget { hosts, db } => {
             let conn = store::open_existing(&db)?;
             for host in hosts {
@@ -259,9 +325,9 @@ async fn run_auto(
 
     if seeds.exists() {
         let urls = read_seeds(Vec::new(), Some(seeds))?;
-        store::add_candidates(&store::open(&db)?, &urls, "seed")?;
+        let retried = store::add_seeds(&store::open(&db)?, &urls)?;
         eprintln!(
-            "Seeds: {} URLs from {} (already crawled sites are skipped)",
+            "Seeds: {} URLs from {} ({retried} sites that failed before are tried again; finished sites are skipped)",
             urls.len(),
             seeds.display()
         );
@@ -277,8 +343,8 @@ async fn run_auto(
             quarter.cancel();
         });
         // A night without Common Crawl is still a useful night of crawling.
-        let skip = cfg.skip.clone();
-        if let Err(e) = run_discover(crawl, discover_files, 4, skip, &db, discover_stop).await {
+        let filter = (cfg.skip.clone(), cfg.broad);
+        if let Err(e) = run_discover(crawl, discover_files, 4, filter, &db, discover_stop).await {
             eprintln!("Discovery skipped: {e:#}");
         }
     }
@@ -316,28 +382,55 @@ fn load_skip(path: &Path) -> Result<filters::SkipList> {
 }
 
 fn crawl_config(args: &CrawlArgs) -> Result<CrawlConfig> {
+    let quality = if args.keep_all {
+        Thresholds::OFF
+    } else {
+        Thresholds {
+            min_big: args.min_big,
+            min_useful: args.min_useful,
+        }
+    };
     Ok(CrawlConfig {
         concurrency: args.concurrency,
         max_dirs_per_host: args.max_dirs,
         max_depth: args.max_depth,
         optout: load_optout(&args.optout)?,
         skip: load_skip(&args.skip)?,
+        quality,
+        broad: args.broad,
         ..CrawlConfig::default()
     })
 }
 
-fn read_seeds(mut raw: Vec<String>, file: Option<&Path>) -> Result<Vec<Url>> {
-    if let Some(file) = file {
-        if !file.exists() {
-            bail!("seed file {} not found", file.display());
+/// Seed URLs from the command line and a seed list: a file, or a folder whose
+/// `*.txt` files are all read.
+fn read_seeds(mut raw: Vec<String>, list: Option<&Path>) -> Result<Vec<Url>> {
+    if let Some(list) = list {
+        if !list.exists() {
+            bail!("seed list {} not found", list.display());
         }
-        raw.extend(filters::load_list(file)?);
+        let files = if list.is_dir() {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(list)?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|ext| ext == "txt"))
+                .collect();
+            files.sort();
+            files
+        } else {
+            vec![list.to_path_buf()]
+        };
+        for file in files {
+            raw.extend(filters::load_list(&file)?);
+        }
     }
-    let mut seeds = Vec::new();
+    let mut seeds: Vec<Url> = Vec::new();
     for s in raw {
         match Url::parse(&s) {
             Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => {
-                seeds.push(url)
+                // The same URL in two lists is crawled once.
+                if !seeds.contains(&url) {
+                    seeds.push(url)
+                }
             }
             _ => eprintln!("skipping seed that is not an http(s) URL: {s}"),
         }
@@ -395,6 +488,49 @@ fn stop_after(stop: &CancellationToken, hours: f64) -> Result<()> {
     Ok(())
 }
 
+/// Applies today's rules to what is stored, and says what was removed.
+/// Returns false if there was nothing to do.
+fn clean_stored(conn: &mut rusqlite::Connection, cfg: &CrawlConfig) -> Result<bool> {
+    let rules = CleanRules {
+        optout: &cfg.optout,
+        skip: &cfg.skip,
+        quality: cfg.quality,
+    };
+    let report = store::clean(conn, &rules)?;
+    print_clean_report(&report);
+    Ok(!report.is_empty())
+}
+
+fn print_clean_report(report: &CleanReport) {
+    for host in &report.opted_out {
+        eprintln!("Removed {host}: it is on the opt-out list");
+    }
+    for host in &report.skipped_hosts {
+        eprintln!("Removed {host}: it is on the skip list");
+    }
+    if report.skipped_dirs > 0 {
+        eprintln!(
+            "Removed {} stored listings inside skipped folders",
+            report.skipped_dirs
+        );
+    }
+    for (host, why) in &report.sensitive {
+        eprintln!("Removed {host}: it looks like an accidental exposure ({why})");
+    }
+    if report.omitted_entries > 0 {
+        eprintln!(
+            "Removed {} sensitive-looking files from sites you added",
+            report.omitted_entries
+        );
+    }
+    if !report.low_value.is_empty() {
+        eprintln!(
+            "Removed {} sites with nothing worth keeping (see them with: opendir sites --status low_value)",
+            report.low_value.len()
+        );
+    }
+}
+
 async fn run_crawl(
     seeds: Vec<Url>,
     pending: Option<Pending>,
@@ -403,19 +539,10 @@ async fn run_crawl(
     stop: CancellationToken,
     progress_every: Duration,
 ) -> Result<()> {
-    let conn = store::open(db)?;
-    // Sites that opted out or were added to the skip list since they were
-    // crawled: keep only their status.
-    for host in store::apply_optout(&conn, &cfg.optout)? {
-        eprintln!("Removed {host}: it is on the opt-out list");
-    }
-    let (skipped_hosts, skipped_dirs) = store::apply_skip_list(&conn, &cfg.skip)?;
-    for host in skipped_hosts {
-        eprintln!("Removed {host}: it is on the skip list");
-    }
-    if skipped_dirs > 0 {
-        eprintln!("Removed {skipped_dirs} stored listings inside skipped folders");
-    }
+    let mut conn = store::open(db)?;
+    // Sites you name now are trusted, so the cleanup below cannot judge them.
+    store::trust_hosts(&conn, &seeds)?;
+    clean_stored(&mut conn, &cfg)?;
     cfg.sensitive_hosts = store::sensitive_hosts(&conn)?.into_iter().collect();
     drop(conn);
     let (tx, writer) = store::spawn_writer(db.to_path_buf())?;
@@ -437,17 +564,18 @@ async fn run_crawl(
     Ok(())
 }
 
+/// `filter` is the skip list and whether to keep listings with no archive signal.
 async fn run_discover(
     crawl: String,
     files: usize,
     parallel: usize,
-    skip: filters::SkipList,
+    filter: (filters::SkipList, bool),
     db: &Path,
     stop: CancellationToken,
 ) -> Result<DiscoverSummary> {
     let done = store::done_cc_files(&store::open(db)?)?;
     let mut cfg = DiscoverConfig::new(crawl, files, parallel, done);
-    cfg.skip = skip;
+    (cfg.skip, cfg.broad) = filter;
     let (tx, writer) = store::spawn_writer(db.to_path_buf())?;
     let stats = Arc::new(DiscoverStats::default());
     let started = Instant::now();
@@ -489,12 +617,13 @@ fn spawn_ticker(
 
 fn discover_line(stats: &DiscoverStats, started: Instant) -> String {
     format!(
-        "[{:>5.0}s] index files {}/{} ({} failed) | {} listing dirs found | {} downloaded",
+        "[{:>5.0}s] index files {}/{} ({} failed) | {} listings kept, {} left out | {} downloaded",
         started.elapsed().as_secs_f64(),
         stats.files_done.load(Relaxed),
         stats.files_planned.load(Relaxed),
         stats.files_failed.load(Relaxed),
         stats.candidates.load(Relaxed),
+        stats.rejected.load(Relaxed),
         human_bytes(stats.bytes.load(Relaxed)),
     )
 }
@@ -555,6 +684,48 @@ fn print_stats(db: &Path) -> Result<()> {
     Ok(())
 }
 
+fn print_sites(db: &Path, status: Option<&str>, sort: SortArg, limit: usize) -> Result<()> {
+    let conn = store::open_existing(db)?;
+    let sort = match sort {
+        SortArg::Size => SiteSort::Size,
+        SortArg::Files => SiteSort::Files,
+        SortArg::Recent => SiteSort::Recent,
+        SortArg::Name => SiteSort::Name,
+    };
+    let sites = store::sites(&conn, status, sort, limit)?;
+    if sites.is_empty() {
+        println!("No sites.");
+        return Ok(());
+    }
+    println!(
+        "{:<36} {:<17} {:>9} {:>10} {:>6}  note",
+        "site", "status", "files", "size", "dirs"
+    );
+    for site in sites {
+        let note = site.reason.or(site.server).unwrap_or_default();
+        println!(
+            "{:<36} {:<17} {:>9} {:>10} {:>6}  {}",
+            truncate(&site.host, 36),
+            site.status,
+            site.files,
+            human_bytes(site.bytes),
+            site.dirs,
+            truncate(&note, 70)
+        );
+    }
+    Ok(())
+}
+
+/// Cuts `text` to at most `max` characters, ending with `…` if it was longer.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
 /// The current time in UTC, for log lines.
 fn utc_now() -> String {
     let secs = SystemTime::now()
@@ -590,5 +761,62 @@ fn human_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bundled_seed_lists_are_valid_and_public() {
+        let seeds = read_seeds(Vec::new(), Some(Path::new("seeds"))).unwrap();
+        assert!(seeds.len() > 80, "{} seeds", seeds.len());
+        for url in &seeds {
+            assert!(filters::is_public_host(url), "{url}");
+            assert!(url.path().ends_with('/'), "a seed is a folder: {url}");
+            assert!(url.query().is_none(), "{url}");
+        }
+        // Every list contributes, and nothing is listed twice.
+        let mut unique = seeds.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seeds.len());
+        let hosts: std::collections::HashSet<_> =
+            seeds.iter().filter_map(|u| u.host_str()).collect();
+        assert!(hosts.contains("releases.ubuntu.com") && hosts.contains("ftp.ncbi.nlm.nih.gov"));
+    }
+
+    #[test]
+    fn the_bundled_skip_list_keeps_package_archives_and_website_junk_out() {
+        let lines = filters::load_list(Path::new("lists/skip.txt")).unwrap();
+        let skip = filters::SkipList::from_lines(&lines);
+        let skipped = |u: &str| skip.skips_folder(&Url::parse(u).unwrap());
+        for junk in [
+            "https://mirror.example.edu/ubuntu/pool/main/",
+            "https://mirror.example.edu/fedora/updates/repodata/",
+            "https://blog.example.com/wp-content/uploads/2020/05/",
+            "https://example.org/cgi-bin/",
+            "https://example.org/backup/",
+        ] {
+            assert!(skipped(junk), "{junk}");
+        }
+        for fine in [
+            "https://releases.ubuntu.com/24.04/",
+            "https://ftp.gnu.org/gnu/emacs/",
+            "https://download.blender.org/release/",
+            "https://example.org/pub/data/",
+        ] {
+            assert!(!skipped(fine), "{fine}");
+        }
+    }
+
+    #[test]
+    fn truncation() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(
+            truncate("a-very-long-host-name.example.org", 10),
+            "a-very-lo…"
+        );
     }
 }

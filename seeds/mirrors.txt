@@ -1,8 +1,32 @@
-# Starting points for `opendir auto` and `opendir crawl --seeds`: a few official
-# release servers with operating system images. Discovery (links between sites
-# and `opendir discover`) finds the rest. Add your own, one folder URL per line.
-https://releases.ubuntu.com/
-https://cdimage.debian.org/debian-cd/
-https://dl.fedoraproject.org/pub/fedora/linux/releases/
-https://download.rockylinux.org/pub/rocky/
-https://mirrors.kernel.org/archlinux/iso/
+# Big general-purpose mirrors run by universities, research networks and
+# providers. Besides distributions they hold old software collections, open data
+# and archives, which is what makes them worth crawling from the root.
+https://mirrors.kernel.org/
+https://mirrors.dotsrc.org/
+https://ftp.nluug.nl/
+https://ftp.funet.fi/pub/
+https://ftp.sunet.se/
+https://ftp.acc.umu.se/
+https://mirror.aarnet.edu.au/pub/
+https://mirrors.mit.edu/
+https://mirror.csclub.uwaterloo.ca/
+https://mirrors.xmission.com/
+https://mirror.math.princeton.edu/pub/
+https://ftp.osuosl.org/pub/
+https://mirrors.ocf.berkeley.edu/
+https://mirrors.sonic.net/
+https://ftp.halifax.rwth-aachen.de/
+https://ftp.fau.de/
+https://ftp.gwdg.de/pub/
+https://gd.tuwien.ac.at/
+https://ftp.icm.edu.pl/pub/
+https://ftp.cvut.cz/
+https://ftp.belnet.be/
+https://mirror.init7.net/
+https://mirror.switch.ch/ftp/
+https://ftp.rediris.es/mirror/
+https://mirror.netcologne.de/
+https://mirror.yandex.ru/
+https://mirrors.ustc.edu.cn/
+https://mirrors.tuna.tsinghua.edu.cn/
+https://ftp.jaist.ac.jp/pub/

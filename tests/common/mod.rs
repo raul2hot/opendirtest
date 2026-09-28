@@ -82,13 +82,21 @@ impl Server {
     /// The same server under the name `localhost`, which the crawler treats
     /// as a different site from `127.0.0.1`.
     pub fn as_localhost(&self) -> Url {
-        Url::parse(&format!("http://localhost:{}/", self.port())).unwrap()
+        self.as_host("localhost")
+    }
+
+    /// The same server under another host name (`127.0.0.2`, `127.0.0.3`, ...),
+    /// which the crawler treats as a different site.
+    pub fn as_host(&self, host: &str) -> Url {
+        Url::parse(&format!("http://{host}:{}/", self.port())).unwrap()
     }
 }
 
 pub async fn serve(routes: HashMap<String, Route>) -> Server {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    // All of 127.0.0.0/8 is loopback, so one server can play several "sites".
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
     let log = Arc::new(Mutex::new(Vec::new()));
     let sent = Arc::new(Mutex::new(HashMap::new()));
     let routes = Arc::new(routes);

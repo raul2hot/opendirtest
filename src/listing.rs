@@ -149,10 +149,15 @@ fn parse_caddy_json(base: &Url, body: &str) -> Option<Listing> {
 // `href` must follow whitespace, so `data-href` is not mistaken for it.
 static ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?is)<a\s(?:[^>]*?\s)?href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>.*?</a\s*>"#,
+        r#"(?is)<a\s(?:[^>]*?\s)?href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>(.*?)</a\s*>"#,
     )
     .unwrap()
 });
+/// The column-header links Apache's `mod_autoindex` (and nginx fancyindex) put
+/// on every listing, e.g. `href="?C=N;O=D"`. Sites that customise the page
+/// title and header still have them.
+static SORT_LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"href\s*=\s*["']?\?c=[nmsd](?:;|&amp;|&)o=[ad]"#).unwrap());
 static COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").unwrap());
 static LISTING_HEADING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)<(?:title|h1|h2)[^>]*>\s*(?:index of\b|directory listing for\b)").unwrap()
@@ -170,7 +175,14 @@ static IIS_ROW: LazyLock<Regex> = LazyLock::new(|| {
 fn detect(lower: &str) -> Option<Server> {
     let is_iis = lower.contains("[to parent directory]") || IIS_ROW.is_match(lower);
     if !is_iis && !LISTING_HEADING.is_match(lower) {
-        return None;
+        // A customised title or header: Apache still gives itself away.
+        return SORT_LINK.is_match(lower).then(|| {
+            if lower.contains("<table id=\"list\">") {
+                Server::Nginx
+            } else {
+                Server::Apache
+            }
+        });
     }
     let server = if is_iis {
         Server::Iis
@@ -188,12 +200,23 @@ fn detect(lower: &str) -> Option<Server> {
     Some(server)
 }
 
+/// One link on the page.
+struct Anchor<'a> {
+    start: usize,
+    end: usize,
+    href: &'a str,
+    /// The link's inner HTML.
+    text: &'a str,
+}
+
 fn parse_html(base: &Url, body: &str) -> Option<Listing> {
     let body = &*COMMENT.replace_all(body, "");
-    let server = detect(&body.to_ascii_lowercase())?;
+    // Pages that give no sign of being a listing are still accepted if their
+    // links look like one (see `looks_like_listing`).
+    let detected = detect(&body.to_ascii_lowercase());
+    let server = detected.unwrap_or(Server::Other);
 
-    // (start, end, href) of every link on the page.
-    let anchors: Vec<(usize, usize, &str)> = ANCHOR
+    let anchors: Vec<Anchor> = ANCHOR
         .captures_iter(body)
         .map(|c| {
             let whole = c.get(0).unwrap();
@@ -202,16 +225,25 @@ fn parse_html(base: &Url, body: &str) -> Option<Listing> {
                 .or(c.get(2))
                 .or(c.get(3))
                 .map_or("", |m| m.as_str());
-            (whole.start(), whole.end(), href)
+            Anchor {
+                start: whole.start(),
+                end: whole.end(),
+                href,
+                text: c.get(4).map_or("", |m| m.as_str()),
+            }
         })
         .collect();
+    let mut evidence = Evidence::default();
 
     let mut entries: Vec<Entry> = Vec::new();
     let mut by_url: HashMap<String, usize> = HashMap::new();
     let mut other_dirs = Vec::new();
     let mut external_dirs = Vec::new();
 
-    for (i, &(start, end, href)) in anchors.iter().enumerate() {
+    for (i, anchor) in anchors.iter().enumerate() {
+        let Anchor {
+            start, end, href, ..
+        } = *anchor;
         let Ok(mut url) = base.join(&decode_entities(href)) else {
             continue;
         };
@@ -235,10 +267,10 @@ fn parse_html(base: &Url, body: &str) -> Option<Listing> {
 
         // IIS prints the date and size before the link; everyone else after it.
         let detail = if server == Server::Iis {
-            let prev_end = if i == 0 { 0 } else { anchors[i - 1].1 };
+            let prev_end = if i == 0 { 0 } else { anchors[i - 1].end };
             clean_text(&body[prev_end..start])
         } else {
-            let next_start = anchors.get(i + 1).map_or(body.len(), |a| a.0);
+            let next_start = anchors.get(i + 1).map_or(body.len(), |a| a.start);
             clean_text(row_tail(&body[end..next_start]))
         };
         let (mtime, size) = parse_details(&detail);
@@ -260,18 +292,60 @@ fn parse_html(base: &Url, body: &str) -> Option<Listing> {
             Some(&j) if entries[j].mtime.is_none() && entry.mtime.is_some() => entries[j] = entry,
             Some(_) => {}
             None => {
+                evidence.add(&entry, anchor.text);
                 by_url.insert(entry.url.to_string(), entries.len());
                 entries.push(entry);
             }
         }
     }
 
+    if detected.is_none() && !evidence.looks_like_listing() {
+        return None;
+    }
     Some(Listing {
         server,
         entries,
         other_dirs,
         external_dirs,
     })
+}
+
+/// What the links on a page say about whether it is a directory listing, for
+/// pages that don't announce it ("Index of ...").
+///
+/// Ordinary pages have links whose text differs from the file name in the URL
+/// (`Read the article` -> `post-17.html`). A listing prints the name itself, and
+/// a date next to it.
+#[derive(Default)]
+struct Evidence {
+    entries: usize,
+    /// Entries whose row has a modification date.
+    dated: usize,
+    /// Entries whose link text is the file name (or its truncation, `name..>`).
+    named: usize,
+}
+
+impl Evidence {
+    fn add(&mut self, entry: &Entry, link_html: &str) {
+        self.entries += 1;
+        self.dated += usize::from(entry.mtime.is_some());
+        let text = clean_text(link_html);
+        let text = text.trim_end_matches('/');
+        let truncated = text
+            .strip_suffix("..>")
+            .or_else(|| text.strip_suffix("&gt;"))
+            .or_else(|| text.strip_suffix('…'))
+            .filter(|prefix| !prefix.is_empty());
+        let matches = match truncated {
+            Some(prefix) => entry.name.starts_with(prefix.trim_end_matches('.')),
+            None => text == entry.name,
+        };
+        self.named += usize::from(matches);
+    }
+
+    fn looks_like_listing(&self) -> bool {
+        self.dated >= 3 && self.named * 10 >= self.entries * 8
+    }
 }
 
 /// The part of the text after a link that belongs to the same row: up to the
@@ -575,6 +649,70 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn apache_with_a_custom_title_and_header() {
+        // Real structure of releases.ubuntu.com: the title says "Ubuntu Releases".
+        let listing = parse_fixture(
+            "https://releases.ubuntu.com/",
+            Some("text/html"),
+            include_str!("../tests/fixtures/apache_custom_header.html"),
+        );
+        assert_eq!(listing.server, Server::Apache);
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"24.04.4") && names.contains(&"14.04"),
+            "{names:?}"
+        );
+        let iso = listing
+            .entries
+            .iter()
+            .find(|e| e.name.ends_with(".iso"))
+            .unwrap();
+        assert_eq!(iso.size, Some(6_657_199_309));
+        assert_eq!(iso.mtime.as_deref(), Some("2025-08-05 10:00"));
+        // The page's own link to another site is kept for discovery.
+        assert!(
+            listing
+                .external_dirs
+                .iter()
+                .any(|u| u.as_str() == "http://old-releases.ubuntu.com/releases/")
+        );
+    }
+
+    #[test]
+    fn unannounced_listings_are_recognised_by_their_links() {
+        let base = Url::parse("https://h.example/pub/").unwrap();
+        let rows = |lines: &[(&str, &str, &str)]| -> String {
+            let mut body = String::from("<html><head><title>Files</title></head><body><pre>\n");
+            for (name, text, date) in lines {
+                body.push_str(&format!("<a href=\"{name}\">{text}</a>  {date}  1.5M\n"));
+            }
+            body + "</pre></body></html>"
+        };
+        // Link text equals the name, with dates: a listing (custom nginx page).
+        let listing = rows(&[
+            ("a.iso", "a.iso", "28-Sep-2026 10:15"),
+            ("b.iso", "b.iso", "27-Sep-2026 10:15"),
+            (
+                "very-long-name.tar.gz",
+                "very-long-na..&gt;",
+                "26-Sep-2026 10:15",
+            ),
+        ]);
+        assert!(parse(&base, None, &listing).is_some());
+        // A blog index: dates next to links, but the link text is a title.
+        let blog = rows(&[
+            ("post-1.html", "Why I like Rust", "28-Sep-2026 10:15"),
+            ("post-2.html", "Notes from a trip", "27-Sep-2026 10:15"),
+            ("post-3.html", "Ten small tips", "26-Sep-2026 10:15"),
+        ]);
+        assert!(parse(&base, None, &blog).is_none());
+        // Matching names but no dates: not enough evidence.
+        let undated = "<title>Files</title><a href=\"a.txt\">a.txt</a> <a href=\"b.txt\">b.txt</a> \
+                       <a href=\"c.txt\">c.txt</a>";
+        assert!(parse(&base, None, undated).is_none());
     }
 
     #[test]

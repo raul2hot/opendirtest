@@ -20,13 +20,14 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::filters;
+use crate::filters::{self, Sensitivity};
 use crate::listing::{self, Entry, Listing};
+use crate::quality::{self, Counts, Thresholds};
 use crate::safety::{
     DROP_SENSITIVE_EXPOSURES, ENFORCE_PER_HOST_RATE_LIMIT, FOLLOW_LISTED_LINKS_ONLY,
     HONOR_OPT_OUT_LIST, RESPECT_ROBOTS_TXT, SEND_IDENTIFYING_USER_AGENT,
 };
-use crate::store::{self, HostStatus, Msg, RESUME_SOURCE};
+use crate::store::{self, HostStatus, Msg, PendingHost, RESUME_SOURCE};
 
 /// Product token matched against `User-agent:` lines in robots.txt.
 pub const BOT_TOKEN: &str = "opendirtest";
@@ -71,6 +72,11 @@ pub struct CrawlConfig {
     /// Record links to local and private-network hosts as sites to crawl.
     /// Only for tests against local servers.
     pub allow_private_links: bool,
+    /// Sites you did not add are dropped if they hold less than this.
+    pub quality: Thresholds,
+    /// Record links to any directory, not only ones that look like a public
+    /// archive (`filters::has_archive_signal`).
+    pub broad: bool,
 }
 
 impl Default for CrawlConfig {
@@ -84,6 +90,8 @@ impl Default for CrawlConfig {
             sensitive_hosts: HashSet::new(),
             skip: filters::SkipList::default(),
             allow_private_links: false,
+            quality: Thresholds::default(),
+            broad: false,
         }
     }
 }
@@ -123,7 +131,7 @@ pub async fn crawl(
     stats: Arc<Stats>,
 ) -> Result<()> {
     let client = build_client()?;
-    let mut ready: VecDeque<(String, Vec<Url>)> = group_by_host(seeds).into();
+    let mut ready: VecDeque<PendingHost> = group_by_host(seeds).into();
     let source = match &pending {
         Some(p) => Some(store::open(&p.db)?),
         None => None,
@@ -157,8 +165,8 @@ pub async fn crawl(
         }
 
         match ready.pop_front() {
-            Some((host, seeds)) => {
-                if !dispatched.insert(host.clone()) {
+            Some(site) => {
+                if !dispatched.insert(site.host.clone()) {
                     continue;
                 }
                 let permit = tokio::select! {
@@ -167,7 +175,9 @@ pub async fn crawl(
                 };
                 stats.hosts_total.fetch_add(1, Relaxed);
                 let worker = HostCrawl {
-                    host,
+                    host: site.host,
+                    trusted: site.trusted,
+                    first_run: !site.known,
                     client: client.clone(),
                     pacer: Pacer::new(cfg.per_host_delay),
                     cfg: cfg.clone(),
@@ -178,8 +188,9 @@ pub async fn crawl(
                     robots_blocked: None,
                     last_error: None,
                 };
+                let urls = site.urls;
                 tasks.spawn(async move {
-                    worker.run(seeds).await;
+                    worker.run(urls).await;
                     drop(permit);
                 });
                 continue;
@@ -200,18 +211,24 @@ pub async fn crawl(
     Ok(())
 }
 
-fn group_by_host(seeds: Vec<Url>) -> Vec<(String, Vec<Url>)> {
-    let mut hosts: Vec<(String, Vec<Url>)> = Vec::new();
+/// Groups the seeds you gave by site. They are trusted: never judged.
+fn group_by_host(seeds: Vec<Url>) -> Vec<PendingHost> {
+    let mut hosts: Vec<PendingHost> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for seed in seeds {
         let Some(host) = seed.host_str().map(str::to_ascii_lowercase) else {
             continue;
         };
         let i = *index.entry(host.clone()).or_insert_with(|| {
-            hosts.push((host, Vec::new()));
+            hosts.push(PendingHost {
+                host,
+                urls: Vec::new(),
+                trusted: true,
+                known: false,
+            });
             hosts.len() - 1
         });
-        hosts[i].1.push(seed);
+        hosts[i].urls.push(seed);
     }
     hosts
 }
@@ -327,6 +344,11 @@ enum Outcome {
 
 struct HostCrawl {
     host: String,
+    /// You added the site: it is never judged by the quality check, and only
+    /// strong sensitive names can drop it.
+    trusted: bool,
+    /// Its first run (not a continuation).
+    first_run: bool,
     client: Client,
     cfg: Arc<CrawlConfig>,
     tx: mpsc::Sender<Msg>,
@@ -361,6 +383,8 @@ impl HostCrawl {
                 dirs: report.dirs,
                 reason: report.reason,
                 purge: report.purge,
+                trusted: self.trusted,
+                judge: (!self.trusted && self.cfg.quality.enabled()).then_some(self.cfg.quality),
             };
             let _ = self.tx.send(msg).await;
         }
@@ -417,6 +441,12 @@ impl HostCrawl {
         let mut overflow_saved = 0;
         let mut gave_up: Option<String> = None;
         let mut errors_in_a_row = 0;
+        // A new site you did not add is judged early, so junk does not hold a
+        // crawl slot: after PROBE_DIRS folders, by what its files look like.
+        let mut counts = Counts::default();
+        let mut probed = false;
+        let early_judge = (!self.trusted && self.first_run && self.cfg.quality.enabled())
+            .then_some(self.cfg.quality);
 
         while let Some((url, depth)) = queue.pop_front() {
             if self.stop.is_cancelled() || dirs >= self.cfg.max_dirs_per_host {
@@ -456,14 +486,16 @@ impl HostCrawl {
                 (page.url, listing)
             })
             .await;
-            let Ok((page_url, Some(listing))) = parsed else {
+            let Ok((page_url, Some(mut listing))) = parsed else {
                 continue;
             };
             dirs += 1;
             self.stats.listings.fetch_add(1, Relaxed);
             server.get_or_insert(listing.server.as_str());
 
-            if DROP_SENSITIVE_EXPOSURES && let Some(why) = sensitive_reason(&page_url, &listing) {
+            if DROP_SENSITIVE_EXPOSURES
+                && let Some(why) = check_exposure(&page_url, &mut listing, self.trusted)
+            {
                 // The purge and the status are stored together, in one message.
                 return Some(Report {
                     status: HostStatus::Sensitive,
@@ -472,6 +504,26 @@ impl HostCrawl {
                     reason: Some(why),
                     purge: true,
                 });
+            }
+
+            for e in listing.entries.iter().filter(|e| !e.is_dir) {
+                counts.add(&e.name, e.size);
+            }
+            if dirs >= quality::PROBE_DIRS
+                && !probed
+                && counts.files >= quality::MIN_EVIDENCE
+                && let Some(thresholds) = early_judge
+            {
+                probed = true; // one early verdict; the writer judges again at the end
+                if let Some(why) = thresholds.judge(&counts, false) {
+                    return Some(Report {
+                        status: HostStatus::LowValue,
+                        server,
+                        dirs,
+                        reason: Some(why),
+                        purge: true,
+                    });
+                }
             }
 
             let Listing {
@@ -573,10 +625,14 @@ impl HostCrawl {
     }
 
     /// Records directories on other sites for a later crawl, except on local
-    /// and private networks.
+    /// and private networks, and (unless `broad`) except ones that show no sign
+    /// of being a public archive.
     async fn save_candidates(&self, mut urls: Vec<Url>) {
         if !self.cfg.allow_private_links {
             urls.retain(filters::is_public_host);
+        }
+        if !self.cfg.broad {
+            urls.retain(filters::has_archive_signal);
         }
         if urls.is_empty() {
             return;
@@ -789,16 +845,28 @@ fn location(response: &Response, base: &Url) -> Option<Url> {
     matches!(url.scheme(), "http" | "https").then_some(url)
 }
 
-/// Why a listing looks like an accidental exposure, if it does.
-fn sensitive_reason(page_url: &Url, listing: &Listing) -> Option<String> {
+/// Checks a listing for signs of an accidental exposure or a compromised
+/// server. Returns why the site should be dropped, if so. On a trusted site,
+/// entries with only a weak sensitive name are removed from the listing instead.
+fn check_exposure(page_url: &Url, listing: &mut Listing, trusted: bool) -> Option<String> {
     if filters::is_sensitive_path(page_url.path()) {
         return Some(format!("listing at {page_url}"));
     }
-    listing
-        .entries
-        .iter()
-        .find(|e| filters::is_sensitive_name(&e.name))
-        .map(|e| format!("found {}", e.url))
+    let mut has_weak = false;
+    for e in &listing.entries {
+        match filters::sensitivity(&e.name) {
+            Some(Sensitivity::Strong) => return Some(format!("found {}", e.url)),
+            Some(Sensitivity::Weak) if !trusted => return Some(format!("found {}", e.url)),
+            Some(Sensitivity::Weak) => has_weak = true,
+            None => {}
+        }
+    }
+    if has_weak {
+        listing
+            .entries
+            .retain(|e| filters::sensitivity(&e.name) != Some(Sensitivity::Weak));
+    }
+    None
 }
 
 async fn read_capped(mut response: Response, cap: usize) -> reqwest::Result<Vec<u8>> {

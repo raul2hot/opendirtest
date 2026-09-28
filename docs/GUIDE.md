@@ -513,7 +513,14 @@ Gbit/s.
   (§3.6, including cross-site redirects). Censys/Shodan and CT logs are not built.
 - Crawls are resumable: a time limit or the per-run directory budget pauses a host
   and saves its frontier as candidates, and `opendir auto` chains nightly runs.
-- There are no trust tiers yet (§6.1). Every verified host is handled like tier 1.
+- Trust has two levels instead of the tiers in §6.1: sites you added (seeds) are
+  trusted; everything else is untrusted and is dropped if it holds too little of value
+  (`src/quality.rs`: 3 big files or 20 useful files, judged early once 100 files are
+  seen, or when the site is finished). Sensitive names are strong (drop the site) or
+  weak (drop an untrusted site, or just the entry on a trusted one), and include the
+  signatures of a compromised server. `opendir clean` re-applies all rules to stored data.
+- Discovery keeps only listings with a sign of a public archive (host and path tokens,
+  `.edu`/`.gov`), since most open directories a web crawl finds are website internals.
 - The `ls-lR` shortcut and mtime-guided recrawl are next.
 
 1. **Parser first:** fixtures and golden tests for the 8 server types in §5.3.

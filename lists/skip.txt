@@ -22,3 +22,21 @@
 /authors/id/            # CPAN (Perl)
 /maven2/                # Maven (Java)
 /distfiles/             # Gentoo and BSD source caches
+
+# Website internals: the upload, cache, log and script folders of ordinary
+# websites (a WordPress blog auto-indexes thousands of thumbnails). Not archives.
+/wp-content/
+/wp-includes/
+/wp-admin/
+/cgi-bin/
+/node_modules/
+/thumbs/
+/thumbnails/
+/cache/
+/tmp/
+/logs/
+
+# Backups of other people's websites and databases: private, and exposed by mistake.
+/backup/
+/backups/
+/bak/

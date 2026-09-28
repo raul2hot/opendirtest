@@ -1,0 +1,25 @@
+# Public science and government data: genomes, maps, weather, astronomy, census,
+# internet registries. Big files, open licences.
+https://dumps.wikimedia.org/other/
+https://planet.openstreetmap.org/
+https://download.bbbike.org/osm/
+https://download.geonames.org/export/
+https://ftp.ncbi.nlm.nih.gov/
+https://ftp.ebi.ac.uk/pub/
+https://ftp.ensembl.org/pub/
+https://hgdownload.soe.ucsc.edu/goldenPath/
+https://ftp.uniprot.org/pub/databases/uniprot/
+https://files.rcsb.org/pub/pdb/
+https://www2.census.gov/
+https://www.ncei.noaa.gov/data/
+https://www.ncei.noaa.gov/pub/data/
+https://ftp.cpc.ncep.noaa.gov/
+https://spdf.gsfc.nasa.gov/pub/
+https://naif.jpl.nasa.gov/pub/naif/
+https://ssd.jpl.nasa.gov/ftp/
+https://cdsarc.cds.unistra.fr/ftp/
+https://archive.stsci.edu/pub/
+https://ftp.ripe.net/
+https://ftp.apnic.net/
+https://ftp.arin.net/pub/
+https://data.iana.org/

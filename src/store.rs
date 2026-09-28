@@ -20,9 +20,10 @@ use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
-use crate::filters;
+use crate::filters::{self, Sensitivity};
 use crate::listing::Entry;
-use crate::safety::{HONOR_OPT_OUT_LIST, HONOR_TAKEDOWN_LIST};
+use crate::quality::{self, Counts, Thresholds};
+use crate::safety::{DROP_SENSITIVE_EXPOSURES, HONOR_OPT_OUT_LIST, HONOR_TAKEDOWN_LIST};
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -36,7 +37,9 @@ CREATE TABLE IF NOT EXISTS hosts (
     files      INTEGER NOT NULL DEFAULT 0,
     bytes      INTEGER NOT NULL DEFAULT 0,
     crawled_at INTEGER NOT NULL,
-    reason     TEXT
+    reason     TEXT,
+    -- 1 for sites you added yourself (seeds): never judged by the quality check.
+    trusted    INTEGER NOT NULL DEFAULT 0
 );
 
 -- One row per folder listing that was read.
@@ -100,6 +103,8 @@ pub enum HostStatus {
     Paused,
     /// On the skip list: not crawled, and nothing stored.
     Skipped,
+    /// Holds nothing worth keeping (see `quality`): the listings were deleted.
+    LowValue,
     /// Given up after too many errors in a row.
     Partial,
     RobotsDisallowed,
@@ -115,6 +120,7 @@ impl HostStatus {
             HostStatus::Done => "done",
             HostStatus::Paused => "paused",
             HostStatus::Skipped => "skipped",
+            HostStatus::LowValue => "low_value",
             HostStatus::Partial => "partial",
             HostStatus::RobotsDisallowed => "robots_disallowed",
             HostStatus::NotListing => "not_listing",
@@ -140,6 +146,11 @@ pub enum Msg {
         /// Delete what was stored for the host (dropped as sensitive, opted out,
         /// or skipped).
         purge: bool,
+        /// A site you added yourself.
+        trusted: bool,
+        /// Judge what is stored for the host by these thresholds, and drop it as
+        /// low value if it fails. `None` for trusted sites.
+        judge: Option<Thresholds>,
     },
     /// Directory URLs worth crawling later. Already-known URLs are ignored.
     Candidates {
@@ -185,8 +196,37 @@ pub fn open(path: &Path) -> Result<Connection> {
             path.display()
         );
     }
+    register_functions(&conn)?;
     conn.execute_batch(SCHEMA)?;
+    // Databases from before the quality check lack `hosts.trusted`.
+    let has_trusted: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('hosts') WHERE name = 'trusted'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_trusted {
+        conn.execute_batch("ALTER TABLE hosts ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(conn)
+}
+
+/// SQL functions used by the cleanup queries: `is_useful(name)` and
+/// `sensitivity(name)` (0 none, 1 weak, 2 strong).
+fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_scalar_function("is_useful", 1, flags, |ctx| {
+        Ok(quality::is_useful(ctx.get_raw(0).as_str().unwrap_or("")))
+    })?;
+    conn.create_scalar_function("sensitivity", 1, flags, |ctx| {
+        Ok(
+            match filters::sensitivity(ctx.get_raw(0).as_str().unwrap_or("")) {
+                None => 0,
+                Some(Sensitivity::Weak) => 1,
+                Some(Sensitivity::Strong) => 2,
+            },
+        )
+    })?;
+    Ok(())
 }
 
 /// Like [`open`], but refuses to create a new, empty database.
@@ -294,13 +334,15 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
             dirs,
             reason,
             purge,
+            trusted,
+            judge,
         } => {
             if *purge {
                 purge_host(conn, host)?;
             }
             conn.execute(
-                "INSERT INTO hosts (host, status, server, dirs, files, bytes, crawled_at, reason)
-                 SELECT ?1, ?2, ?3, ?4, count(e.id), CAST(total(e.size) AS INTEGER), ?5, ?6
+                "INSERT INTO hosts (host, status, server, dirs, files, bytes, crawled_at, reason, trusted)
+                 SELECT ?1, ?2, ?3, ?4, count(e.id), CAST(total(e.size) AS INTEGER), ?5, ?6, ?7
                  FROM dirs d JOIN entries e ON e.dir_id = d.id AND e.is_dir = 0
                  WHERE d.host = ?1
                  ON CONFLICT(host) DO UPDATE SET
@@ -308,11 +350,23 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
                     dirs = excluded.dirs
                         + CASE WHEN hosts.status = 'paused' THEN hosts.dirs ELSE 0 END,
                     files = excluded.files, bytes = excluded.bytes,
-                    crawled_at = excluded.crawled_at, reason = excluded.reason",
-                params![host, status.as_str(), server, *dirs as i64, now, reason],
+                    crawled_at = excluded.crawled_at, reason = excluded.reason,
+                    trusted = max(hosts.trusted, excluded.trusted)",
+                params![host, status.as_str(), server, *dirs as i64, now, reason, *trusted],
             )?;
             if *status != HostStatus::Paused {
                 conn.execute("DELETE FROM candidates WHERE host = ?1", [host])?;
+            }
+            // Judge everything stored for the site, across runs.
+            let judged = matches!(
+                status,
+                HostStatus::Done | HostStatus::Paused | HostStatus::Partial
+            );
+            let finished = *status == HostStatus::Done;
+            if let (Some(thresholds), true) = (judge, judged)
+                && let Some(why) = thresholds.judge(&host_counts(conn, host)?, finished)
+            {
+                mark_host(conn, host, HostStatus::LowValue, &why)?;
             }
         }
         Msg::Candidates { urls, source } => insert_candidates(conn, urls, source, now)?,
@@ -424,6 +478,40 @@ fn purge_host(conn: &Connection, host: &str) -> Result<usize> {
     Ok(files)
 }
 
+/// What a site holds, counted over all its stored files.
+fn host_counts(conn: &Connection, host: &str) -> Result<Counts> {
+    let counts = conn.query_row(
+        "SELECT count(e.id), coalesce(sum(e.size >= ?2), 0), coalesce(sum(is_useful(e.name)), 0)
+         FROM dirs d JOIN entries e ON e.dir_id = d.id AND e.is_dir = 0
+         WHERE d.host = ?1",
+        params![host, quality::BIG_FILE as i64],
+        |row| {
+            Ok(Counts {
+                files: row.get::<_, i64>(0)? as u64,
+                big: row.get::<_, i64>(1)? as u64,
+                useful: row.get::<_, i64>(2)? as u64,
+            })
+        },
+    )?;
+    Ok(counts)
+}
+
+/// Deletes everything stored for a site and keeps only its status and the
+/// reason, so it is not found and crawled again.
+fn mark_host(conn: &Connection, host: &str, status: HostStatus, reason: &str) -> Result<()> {
+    let msg = Msg::HostDone {
+        host: host.to_string(),
+        status,
+        server: None,
+        dirs: 0,
+        reason: Some(reason.to_string()),
+        purge: true,
+        trusted: false,
+        judge: None,
+    };
+    apply(conn, &msg)
+}
+
 // ---------------------------------------------------------------------------
 // Candidates: work still to do
 // ---------------------------------------------------------------------------
@@ -433,6 +521,37 @@ fn purge_host(conn: &Connection, host: &str) -> Result<usize> {
 /// saved frontier instead.
 pub fn add_candidates(conn: &Connection, urls: &[Url], source: &str) -> Result<()> {
     insert_candidates(conn, urls, source, unix_now())
+}
+
+/// Marks sites you named on the command line as trusted, so the quality check
+/// never judges them.
+pub fn trust_hosts(conn: &Connection, urls: &[Url]) -> Result<()> {
+    let hosts: HashSet<&str> = urls.iter().filter_map(|u| u.host_str()).collect();
+    for host in hosts {
+        conn.execute("UPDATE hosts SET trusted = 1 WHERE host = ?1", [host])?;
+    }
+    Ok(())
+}
+
+/// `candidates.source` for sites you added yourself.
+pub const SEED_SOURCE: &str = "seed";
+
+/// Adds sites you chose. They are trusted, and earlier verdicts that a retry or
+/// a fix may change (not a listing, unreachable, given up, low value) are
+/// forgotten so they are tried again. Returns how many sites were retried.
+pub fn add_seeds(conn: &Connection, urls: &[Url]) -> Result<usize> {
+    let hosts: HashSet<&str> = urls.iter().filter_map(|u| u.host_str()).collect();
+    let mut retried = 0;
+    for host in hosts {
+        retried += conn.execute(
+            "DELETE FROM hosts WHERE host = ?1
+             AND status IN ('not_listing', 'unreachable', 'partial', 'low_value')",
+            [host],
+        )?;
+        conn.execute("UPDATE hosts SET trusted = 1 WHERE host = ?1", [host])?;
+    }
+    insert_candidates(conn, urls, SEED_SOURCE, unix_now())?;
+    Ok(retried)
 }
 
 fn insert_candidates(conn: &Connection, urls: &[Url], source: &str, now: i64) -> Result<()> {
@@ -452,40 +571,71 @@ fn insert_candidates(conn: &Connection, urls: &[Url], source: &str, now: i64) ->
     Ok(())
 }
 
-/// Up to `want` hosts with work to do, oldest first, skipping `exclude` (hosts
-/// already being crawled). Each comes with all its seed URLs. They are not
-/// pruned to the shallowest: a site's `/` is often a homepage rather than a
-/// listing, so `/pub/` must stay a seed. The crawler never fetches a URL twice.
+/// A site with work waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHost {
+    pub host: String,
+    /// All its seed URLs. They are not pruned to the shallowest: a site's `/` is
+    /// often a homepage rather than a listing, so `/pub/` must stay a seed. The
+    /// crawler never fetches a URL twice.
+    pub urls: Vec<Url>,
+    /// You added it (a seed), now or in an earlier run.
+    pub trusted: bool,
+    /// It was crawled before (paused), so this is not its first run.
+    pub known: bool,
+}
+
+/// Up to `want` sites with work to do, skipping `exclude` (sites already being
+/// crawled). Sites you added come first, then sites being continued, then sites
+/// found through links, then Common Crawl finds; oldest first within each.
 pub fn pending_hosts(
     conn: &Connection,
     want: usize,
     exclude: &HashSet<String>,
-) -> Result<Vec<(String, Vec<Url>)>> {
+) -> Result<Vec<PendingHost>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT host, url FROM candidates WHERE host IN (
-             SELECT c.host FROM candidates c
-             WHERE NOT EXISTS (SELECT 1 FROM hosts h WHERE h.host = c.host AND h.status != 'paused')
-             GROUP BY c.host ORDER BY min(c.found_at), c.host LIMIT ?1)
-         ORDER BY host, length(url), url",
+        "SELECT c.host, c.url,
+                EXISTS (SELECT 1 FROM candidates s WHERE s.host = c.host AND s.source = 'seed')
+                    OR coalesce((SELECT h.trusted FROM hosts h WHERE h.host = c.host), 0),
+                EXISTS (SELECT 1 FROM hosts h WHERE h.host = c.host)
+         FROM candidates c
+         JOIN (SELECT c2.host AS host,
+                      min(CASE c2.source WHEN 'seed' THEN 0 WHEN 'resume' THEN 1
+                                         WHEN 'link' THEN 2 ELSE 3 END) AS prio,
+                      min(c2.found_at) AS found
+               FROM candidates c2
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM hosts h WHERE h.host = c2.host AND h.status != 'paused')
+               GROUP BY c2.host
+               ORDER BY prio, found, c2.host
+               LIMIT ?1) r ON r.host = c.host
+         ORDER BY r.prio, r.found, c.host, length(c.url), c.url",
     )?;
     let limit = (want + exclude.len()) as i64;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+    let rows: Vec<(String, String, bool, bool)> = stmt
+        .query_map([limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut hosts: Vec<(String, Vec<Url>)> = Vec::new();
-    for (host, raw) in rows {
+    let mut hosts: Vec<PendingHost> = Vec::new();
+    for (host, raw, trusted, known) in rows {
         if exclude.contains(&host) {
             continue;
         }
-        if hosts.last().is_none_or(|(h, _)| *h != host) {
+        if hosts.last().is_none_or(|h| h.host != host) {
             if hosts.len() == want {
                 break;
             }
-            hosts.push((host, Vec::new()));
+            hosts.push(PendingHost {
+                host,
+                urls: Vec::new(),
+                trusted,
+                known,
+            });
         }
-        if let (Ok(url), Some((_, seeds))) = (Url::parse(&raw), hosts.last_mut()) {
-            seeds.push(url);
+        if let (Ok(url), Some(last)) = (Url::parse(&raw), hosts.last_mut()) {
+            last.urls.push(url);
         }
     }
     Ok(hosts)
@@ -549,15 +699,157 @@ fn drop_listed_hosts(
         .filter(|h| filters::host_opted_out(h, list))
         .collect();
     for host in &dropped {
-        let msg = Msg::HostDone {
-            host: host.clone(),
-            status,
-            server: None,
-            dirs: 0,
-            reason: Some(reason.into()),
-            purge: true,
-        };
-        apply(conn, &msg)?;
+        mark_host(conn, host, status, reason)?;
+    }
+    Ok(dropped)
+}
+
+/// What to enforce on stored data.
+pub struct CleanRules<'a> {
+    pub optout: &'a [String],
+    pub skip: &'a filters::SkipList,
+    pub quality: Thresholds,
+}
+
+/// What `clean` removed.
+#[derive(Debug, Default)]
+pub struct CleanReport {
+    pub opted_out: Vec<String>,
+    pub skipped_hosts: Vec<String>,
+    pub skipped_dirs: usize,
+    /// Sites dropped as sensitive, with the reason.
+    pub sensitive: Vec<(String, String)>,
+    /// Single entries removed from trusted sites (weak sensitive names).
+    pub omitted_entries: usize,
+    /// Sites dropped as low value, with the reason.
+    pub low_value: Vec<(String, String)>,
+}
+
+impl CleanReport {
+    pub fn is_empty(&self) -> bool {
+        self.opted_out.is_empty()
+            && self.skipped_hosts.is_empty()
+            && self.skipped_dirs == 0
+            && self.sensitive.is_empty()
+            && self.omitted_entries == 0
+            && self.low_value.is_empty()
+    }
+}
+
+/// Applies today's rules to what is already stored, so the database heals when
+/// the rules improve: opt-outs, the skip list, sensitive names and folders, and
+/// the quality check. Runs at the start of every crawl.
+pub fn clean(conn: &mut Connection, rules: &CleanRules) -> Result<CleanReport> {
+    let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut report = CleanReport {
+        opted_out: apply_optout(&txn, rules.optout)?,
+        ..CleanReport::default()
+    };
+    (report.skipped_hosts, report.skipped_dirs) = apply_skip_list(&txn, rules.skip)?;
+    if DROP_SENSITIVE_EXPOSURES {
+        (report.sensitive, report.omitted_entries) = apply_sensitive(&txn)?;
+    }
+    if rules.quality.enabled() {
+        report.low_value = apply_quality(&txn, rules.quality)?;
+    }
+    txn.commit()?;
+    Ok(report)
+}
+
+/// Sites with a strong sensitive name or folder are dropped; a weak name drops
+/// a site you did not add yourself, and only the entry on one you did.
+fn apply_sensitive(conn: &Connection) -> Result<(Vec<(String, String)>, usize)> {
+    let mut to_drop: HashMap<String, String> = HashMap::new();
+    let mut omit: Vec<i64> = Vec::new();
+
+    let mut stmt = conn.prepare(
+        "SELECT d.host, d.url, e.id, e.name, sensitivity(e.name), coalesce(h.trusted, 0)
+         FROM entries e JOIN dirs d ON d.id = e.dir_id
+         LEFT JOIN hosts h ON h.host = d.host
+         WHERE sensitivity(e.name) > 0",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, bool>(5)?,
+        ))
+    })?;
+    for row in rows {
+        let (host, dir_url, id, name, level, trusted) = row?;
+        if level == 2 || !trusted {
+            to_drop
+                .entry(host)
+                .or_insert(format!("found {dir_url}{name}"));
+        } else {
+            omit.push(id);
+        }
+    }
+    drop(stmt);
+
+    let mut stmt = conn.prepare("SELECT host, url FROM dirs")?;
+    let dirs = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (host, url) in dirs {
+        if Url::parse(&url).is_ok_and(|u| filters::is_sensitive_path(u.path())) {
+            to_drop.entry(host).or_insert(format!("listing at {url}"));
+        }
+    }
+
+    let mut dropped: Vec<(String, String)> = to_drop.into_iter().collect();
+    dropped.sort();
+    for (host, reason) in &dropped {
+        mark_host(conn, host, HostStatus::Sensitive, reason)?;
+    }
+    // Entries of dropped sites are already gone; delete the rest one by one.
+    let mut omitted = 0;
+    for id in omit {
+        conn.execute("DELETE FROM entries_fts WHERE rowid = ?1", [id])?;
+        omitted += conn.execute("DELETE FROM entries WHERE id = ?1", [id])?;
+    }
+    Ok((dropped, omitted))
+}
+
+/// Drops sites you did not add that hold too little to keep.
+fn apply_quality(conn: &Connection, thresholds: Thresholds) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.host, h.status, count(e.id), coalesce(sum(e.size >= ?1), 0),
+                coalesce(sum(is_useful(e.name)), 0)
+         FROM hosts h
+         LEFT JOIN dirs d ON d.host = h.host
+         LEFT JOIN entries e ON e.dir_id = d.id AND e.is_dir = 0
+         WHERE h.trusted = 0 AND h.status IN ('done', 'paused', 'partial')
+         GROUP BY h.host
+         ORDER BY h.host",
+    )?;
+    let rows = stmt
+        .query_map([quality::BIG_FILE as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)? == HostStatus::Done.as_str(),
+                Counts {
+                    files: row.get::<_, i64>(2)? as u64,
+                    big: row.get::<_, i64>(3)? as u64,
+                    useful: row.get::<_, i64>(4)? as u64,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut dropped = Vec::new();
+    for (host, finished, counts) in rows {
+        if let Some(reason) = thresholds.judge(&counts, finished) {
+            mark_host(conn, &host, HostStatus::LowValue, &reason)?;
+            dropped.push((host, reason));
+        }
     }
     Ok(dropped)
 }
@@ -596,8 +888,10 @@ fn unix_now() -> i64 {
 
 pub struct SearchOptions {
     pub limit: usize,
-    /// Only files with this extension (without the dot).
+    /// Only files with one of these extensions, separated by commas: `mp3,flac`.
     pub ext: Option<String>,
+    /// Only files at least this many bytes big.
+    pub min_bytes: Option<u64>,
     /// Skip the likely-infringement filter.
     pub unfiltered: bool,
     /// URL prefixes hidden from results (`HONOR_TAKEDOWN_LIST`).
@@ -621,10 +915,23 @@ pub fn search(conn: &Connection, query: &str, opts: SearchOptions) -> Result<Vec
     let SearchOptions {
         limit,
         ext,
+        min_bytes,
         unfiltered,
         takedown,
         optout,
     } = opts;
+    conn.create_scalar_function(
+        "ext_in",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let name = ctx.get_raw(0).as_str().unwrap_or("").to_lowercase();
+            let list = ctx.get_raw(1).as_str().unwrap_or("");
+            Ok(list
+                .split(',')
+                .any(|ext| !ext.is_empty() && name.ends_with(&format!(".{ext}"))))
+        },
+    )?;
     conn.create_scalar_function(
         "hidden",
         3,
@@ -649,18 +956,28 @@ pub fn search(conn: &Connection, query: &str, opts: SearchOptions) -> Result<Vec
              JOIN entries e ON e.id = entries_fts.rowid
              JOIN dirs d ON d.id = e.dir_id
              WHERE entries_fts MATCH ?1
-               AND (?2 IS NULL
-                    OR (e.is_dir = 0 AND substr(lower(e.name), -length(?2) - 1) = '.' || ?2))
+               AND (?2 IS NULL OR (e.is_dir = 0 AND ext_in(e.name, ?2)))
+               AND (?4 IS NULL OR e.size >= ?4)
          ) r
          WHERE NOT hidden(r.url, r.name, r.host)
            AND NOT EXISTS (SELECT 1 FROM hosts h WHERE h.host = r.host
-                           AND h.status IN ('opted_out', 'sensitive', 'skipped'))
+                           AND h.status IN ('opted_out', 'sensitive', 'skipped', 'low_value'))
          ORDER BY r.rank
          LIMIT ?3",
     )?;
-    let ext = ext.map(|e| e.trim_start_matches('.').to_lowercase());
+    // `mp3, .FLAC` -> `mp3,flac`
+    let ext = ext
+        .map(|list| {
+            list.split([',', ' '])
+                .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                .filter(|e| !e.is_empty())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|list| !list.is_empty());
+    let min_bytes = min_bytes.map(|b| b as i64);
     let hits = stmt
-        .query_map(params![fts_query, ext, limit as i64], |row| {
+        .query_map(params![fts_query, ext, limit as i64, min_bytes], |row| {
             Ok(Hit {
                 url: row.get(0)?,
                 name: row.get(1)?,
@@ -695,6 +1012,57 @@ pub struct StatusCount {
 }
 
 /// Work still to do, per source.
+/// A crawled (or judged) site, for `opendir sites`.
+pub struct Site {
+    pub host: String,
+    pub status: String,
+    pub files: u64,
+    pub bytes: u64,
+    pub dirs: u64,
+    pub server: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteSort {
+    Size,
+    Files,
+    Recent,
+    Name,
+}
+
+pub fn sites(
+    conn: &Connection,
+    status: Option<&str>,
+    sort: SiteSort,
+    limit: usize,
+) -> Result<Vec<Site>> {
+    let order = match sort {
+        SiteSort::Size => "bytes DESC, host",
+        SiteSort::Files => "files DESC, host",
+        SiteSort::Recent => "crawled_at DESC, host",
+        SiteSort::Name => "host",
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT host, status, files, bytes, dirs, server, reason FROM hosts
+         WHERE (?1 IS NULL OR status = ?1) ORDER BY {order} LIMIT ?2"
+    ))?;
+    let rows = stmt
+        .query_map(params![status, limit as i64], |row| {
+            Ok(Site {
+                host: row.get(0)?,
+                status: row.get(1)?,
+                files: row.get::<_, i64>(2)? as u64,
+                bytes: row.get::<_, i64>(3)? as u64,
+                dirs: row.get::<_, i64>(4)? as u64,
+                server: row.get(5)?,
+                reason: row.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
 pub struct CandidateCount {
     pub source: String,
     pub urls: u64,
@@ -803,6 +1171,7 @@ mod tests {
         let opts = SearchOptions {
             limit: 100,
             ext: None,
+            min_bytes: None,
             unfiltered: true,
             takedown: vec![],
             optout: vec![],
@@ -858,6 +1227,8 @@ mod tests {
             dirs: 1,
             reason: None,
             purge: true,
+            trusted: false,
+            judge: None,
         };
         apply(&conn, &done).unwrap();
         assert!(files(&conn).is_empty());
@@ -895,6 +1266,263 @@ mod tests {
         assert!(per_file < 180, "{per_file} bytes per file");
     }
 
+    /// Stores `files` (name, size) under `https://{host}/{folder}/` and marks the site done.
+    fn add_site(
+        conn: &Connection,
+        host: &str,
+        folder: &str,
+        files: &[(&str, Option<u64>)],
+        trusted: bool,
+        judge: Option<Thresholds>,
+    ) {
+        let entries = files
+            .iter()
+            .map(|(name, size)| entry(&format!("https://{host}/{folder}/{name}"), false, *size))
+            .collect();
+        let msg = Msg::Entries {
+            host: host.into(),
+            entries,
+        };
+        apply(conn, &msg).unwrap();
+        let done = Msg::HostDone {
+            host: host.into(),
+            status: HostStatus::Done,
+            server: None,
+            dirs: 1,
+            reason: None,
+            purge: false,
+            trusted,
+            judge,
+        };
+        apply(conn, &done).unwrap();
+    }
+
+    fn status(conn: &Connection, host: &str) -> String {
+        conn.query_row("SELECT status FROM hosts WHERE host = ?1", [host], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    fn photos(n: u64) -> Vec<(String, Option<u64>)> {
+        (0..n)
+            .map(|i| (format!("photo-{i}.jpg"), Some(40_000)))
+            .collect()
+    }
+
+    #[test]
+    fn clean_applies_todays_rules_to_stored_data() {
+        let mut conn = open(&temp_path("clean")).unwrap();
+        let junk: Vec<(String, Option<u64>)> = photos(30);
+        let junk: Vec<(&str, Option<u64>)> = junk.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let big = Some(4_000_000_000);
+        add_site(&conn, "junk.example", "pics", &junk, false, None);
+        add_site(
+            &conn,
+            "good.example",
+            "iso",
+            &[("a.iso", big), ("b.iso", big), ("c.iso", big)],
+            false,
+            None,
+        );
+        add_site(
+            &conn,
+            "mine.example",
+            "x",
+            &[("notes.txt", Some(5))],
+            true,
+            None,
+        );
+        add_site(
+            &conn,
+            "leak.example",
+            "www",
+            &[(".env", Some(90)), ("index.php", Some(9))],
+            false,
+            None,
+        );
+        add_site(
+            &conn,
+            "weak-mine.example",
+            "d",
+            &[("backup-2026-01-01.zip", big), ("a.iso", big)],
+            true,
+            None,
+        );
+        add_site(
+            &conn,
+            "weak-other.example",
+            "d",
+            &[("db_dump.sql.gz", big), ("a.iso", big)],
+            false,
+            None,
+        );
+        // A folder of links to other accounts' config files, listed by a compromised server.
+        add_site(
+            &conn,
+            "hacked.example",
+            "sym404",
+            &[("readme.txt", Some(3))],
+            false,
+            None,
+        );
+
+        let rules = CleanRules {
+            optout: &[],
+            skip: &filters::SkipList::default(),
+            quality: Thresholds::default(),
+        };
+        let report = clean(&mut conn, &rules).unwrap();
+
+        assert_eq!(status(&conn, "junk.example"), "low_value");
+        assert_eq!(status(&conn, "good.example"), "done");
+        assert_eq!(
+            status(&conn, "mine.example"),
+            "done",
+            "yours is never judged"
+        );
+        assert_eq!(status(&conn, "leak.example"), "sensitive");
+        assert_eq!(status(&conn, "weak-other.example"), "sensitive");
+        assert_eq!(status(&conn, "hacked.example"), "sensitive");
+        // Your own site only loses the weak entry.
+        assert_eq!(status(&conn, "weak-mine.example"), "done");
+        assert_eq!(report.omitted_entries, 1);
+        let mine: Vec<String> = files(&conn)
+            .into_iter()
+            .filter(|u| u.contains("weak-mine"))
+            .collect();
+        assert_eq!(mine, vec!["https://weak-mine.example/d/a.iso"]);
+        assert_eq!(report.low_value.len(), 1);
+        assert_eq!(report.sensitive.len(), 3);
+        assert!(
+            report
+                .sensitive
+                .iter()
+                .any(|(h, why)| h == "hacked.example" && why.contains("sym404"))
+        );
+        // Dropped sites keep only their status.
+        assert!(
+            !files(&conn)
+                .iter()
+                .any(|u| u.contains("junk.example") || u.contains("leak.example"))
+        );
+        assert_eq!(hits(&conn, "photo"), 0);
+        assert_eq!(hits(&conn, "index"), 0);
+
+        // A second pass finds nothing more to do.
+        assert!(clean(&mut conn, &rules).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_writer_judges_a_site_when_it_finishes() {
+        let conn = open(&temp_path("judge")).unwrap();
+        let t = Some(Thresholds::default());
+        let junk = photos(5);
+        let junk: Vec<(&str, Option<u64>)> = junk.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        add_site(&conn, "small.example", "d", &junk, false, t);
+        add_site(&conn, "seed.example", "d", &junk, true, None);
+        assert_eq!(status(&conn, "small.example"), "low_value");
+        assert_eq!(status(&conn, "seed.example"), "done");
+        assert!(files(&conn).iter().all(|u| !u.contains("small.example")));
+        // An unfinished site with few files so far is not judged yet.
+        let msg = Msg::Entries {
+            host: "early.example".into(),
+            entries: vec![entry("https://early.example/d/a.jpg", false, Some(9_000))],
+        };
+        apply(&conn, &msg).unwrap();
+        let paused = Msg::HostDone {
+            host: "early.example".into(),
+            status: HostStatus::Paused,
+            server: None,
+            dirs: 3,
+            reason: None,
+            purge: false,
+            trusted: false,
+            judge: t,
+        };
+        apply(&conn, &paused).unwrap();
+        assert_eq!(status(&conn, "early.example"), "paused");
+        // The verdict counts everything stored across runs, not just this run.
+        let big = Some(50_000_000);
+        add_site(
+            &conn,
+            "grows.example",
+            "d",
+            &[("a.iso", big), ("b.iso", big)],
+            false,
+            None,
+        );
+        add_site(&conn, "grows.example", "e", &[("c.iso", big)], false, t);
+        assert_eq!(status(&conn, "grows.example"), "done");
+    }
+
+    #[test]
+    fn seeds_are_trusted_and_forget_earlier_verdicts() {
+        let conn = open(&temp_path("seeds")).unwrap();
+        let url = |u: &str| Url::parse(u).unwrap();
+        for (host, status) in [
+            ("a.example", "not_listing"),
+            ("b.example", "low_value"),
+            ("c.example", "robots_disallowed"),
+            ("d.example", "done"),
+        ] {
+            conn.execute(
+                "INSERT INTO hosts (host, status, crawled_at) VALUES (?1, ?2, 0)",
+                [host, status],
+            )
+            .unwrap();
+        }
+        let seeds = [
+            url("https://a.example/pub/"),
+            url("https://b.example/pub/"),
+            url("https://c.example/pub/"),
+            url("https://d.example/pub/"),
+            url("https://new.example/pub/"),
+        ];
+        let retried = add_seeds(&conn, &seeds).unwrap();
+        assert_eq!(retried, 2, "not_listing and low_value are tried again");
+        let waiting: Vec<String> = pending_hosts(&conn, 10, &HashSet::new())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.host)
+            .collect();
+        assert_eq!(waiting, vec!["a.example", "b.example", "new.example"]);
+        // Robots.txt verdicts are respected, and finished sites stay finished, but trusted.
+        assert_eq!(status(&conn, "c.example"), "robots_disallowed");
+        let trusted: i64 = conn
+            .query_row(
+                "SELECT trusted FROM hosts WHERE host = 'd.example'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trusted, 1);
+    }
+
+    #[test]
+    fn upgrades_a_database_without_the_trusted_column() {
+        let path = temp_path("no-trusted");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE hosts (host TEXT PRIMARY KEY, status TEXT NOT NULL, server TEXT,
+                 dirs INTEGER NOT NULL DEFAULT 0, files INTEGER NOT NULL DEFAULT 0,
+                 bytes INTEGER NOT NULL DEFAULT 0, crawled_at INTEGER NOT NULL, reason TEXT);
+                 INSERT INTO hosts VALUES ('old.example', 'done', NULL, 3, 10, 99, 0, NULL);",
+            )
+            .unwrap();
+        let conn = open(&path).unwrap();
+        let trusted: i64 = conn
+            .query_row(
+                "SELECT trusted FROM hosts WHERE host = 'old.example'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trusted, 0);
+        assert_eq!(status(&conn, "old.example"), "done");
+    }
+
     #[test]
     fn pending_hosts_skip_finished_and_busy_hosts() {
         let conn = open(&temp_path("candidates")).unwrap();
@@ -923,6 +1551,8 @@ mod tests {
             dirs: 1,
             reason: None,
             purge: false,
+            trusted: false,
+            judge: None,
         };
         apply(&conn, &done).unwrap();
 
@@ -930,7 +1560,7 @@ mod tests {
         let pending = pending_hosts(&conn, 10, &none).unwrap();
         let urls: Vec<String> = pending
             .iter()
-            .flat_map(|(_, u)| u.iter().map(Url::to_string))
+            .flat_map(|h| h.urls.iter().map(Url::to_string))
             .collect();
         assert_eq!(
             urls,
@@ -953,17 +1583,17 @@ mod tests {
 
         let one = pending_hosts(&conn, 1, &none).unwrap();
         assert_eq!(one.len(), 1);
-        assert_eq!(one[0].0, "a.example");
+        assert_eq!(one[0].host, "a.example");
         let busy: HashSet<String> = ["a.example".to_string()].into();
         let others = pending_hosts(&conn, 10, &busy).unwrap();
         assert_eq!(others.len(), 1);
-        assert_eq!(others[0].0, "b.example");
+        assert_eq!(others[0].host, "b.example");
 
         // Candidates for a finished host are ignored.
         let late = [Url::parse("https://done.example/new/").unwrap()];
         add_candidates(&conn, &late, "link").unwrap();
         let hosts = pending_hosts(&conn, 10, &none).unwrap();
-        assert!(hosts.iter().all(|(h, _)| h != "done.example"));
+        assert!(hosts.iter().all(|h| h.host != "done.example"));
     }
 
     #[test]
@@ -987,11 +1617,13 @@ mod tests {
             dirs: 3,
             reason: None,
             purge: false,
+            trusted: false,
+            judge: None,
         };
         apply(&conn, &status).unwrap();
 
         let pending = pending_hosts(&conn, 10, &HashSet::new()).unwrap();
-        let urls: Vec<&str> = pending[0].1.iter().map(Url::as_str).collect();
+        let urls: Vec<&str> = pending[0].urls.iter().map(Url::as_str).collect();
         assert_eq!(
             urls,
             vec!["https://m.example/pub/b/", "https://m.example/pub/c/"]
@@ -1000,7 +1632,7 @@ mod tests {
         // Re-adding the seed (as `auto` does every night) must not restart the walk.
         add_candidates(&conn, &[url("https://m.example/pub/")], "seed").unwrap();
         let pending = pending_hosts(&conn, 10, &HashSet::new()).unwrap();
-        assert_eq!(pending[0].1.len(), 2);
+        assert_eq!(pending[0].urls.len(), 2);
 
         // The next run finishes it; directory counts add up across runs.
         let done = Msg::HostDone {
@@ -1010,6 +1642,8 @@ mod tests {
             dirs: 2,
             reason: None,
             purge: false,
+            trusted: false,
+            judge: None,
         };
         apply(&conn, &done).unwrap();
         let dirs: i64 = conn

@@ -5,8 +5,9 @@ servers that publish auto-generated file listings, such as software mirrors, pub
 datasets and academic archives.
 
 It stores file metadata only (name, size, date) and never downloads files. It follows
-robots.txt, sends at most about one request per second to each site, and drops sites that
-look like accidental leaks.
+robots.txt, sends at most about one request per second to each site, drops sites that
+look like accidental leaks or hacked servers, and keeps only sites that hold real
+downloads.
 
 ## Quick start (Windows)
 
@@ -20,38 +21,68 @@ look like accidental leaks.
    cargo build --release
    ```
 
-3. Crawl the bundled starting points (official operating system release servers).
-   `--max-dirs 500` keeps the first run to roughly 10 minutes (longer for sites whose
-   robots.txt asks for a slower pace):
+3. Crawl the bundled starting points: about 100 official archives (operating system
+   images, big mirrors, open source releases, science data, books). All sites run in
+   parallel, and `--max-dirs 300` limits each to 300 folders, so this takes roughly
+   10 minutes:
 
    ```powershell
-   .\target\release\opendir.exe crawl --seeds seeds\mirrors.txt --max-dirs 500
+   .\target\release\opendir.exe crawl --seeds seeds --max-dirs 300
    ```
 
-4. Search and inspect:
+4. Look at what you got:
 
    ```powershell
+   .\target\release\opendir.exe sites
    .\target\release\opendir.exe search ubuntu desktop --ext iso
-   .\target\release\opendir.exe search debian netinst -n 50
-   .\target\release\opendir.exe search fedora workstation --ext iso
+   .\target\release\opendir.exe search dataset --ext csv,parquet --min-mb 100
    .\target\release\opendir.exe stats
    ```
 
 Press Ctrl-C during a crawl to stop cleanly. Everything found so far is saved.
 On Linux or macOS, the same commands work with `./target/release/opendir`.
 
+## Seeds: where the crawl starts
+
+The crawler visits the sites you give it and the sites it finds. Good seeds decide
+whether the database is full of useful things. [`seeds/`](seeds) holds lists you can
+edit, one folder URL per line:
+
+| File | What is in it |
+|---|---|
+| `os-images.txt` | Ubuntu, Debian, Fedora, Rocky, Arch, openSUSE, the BSDs, Alpine, Kali, ... |
+| `mirrors.txt` | Big university and research-network mirrors. They hold old software collections and open data far beyond the distributions. |
+| `software.txt` | Release servers of GNU, the Linux kernel, Mozilla, KDE, GNOME, Blender, Python, Node.js, ... |
+| `science-data.txt` | NCBI, EBI, UCSC, NOAA, NASA, US Census, OpenStreetMap, Wikimedia dumps, internet registries. |
+| `books-media.txt` | Project Gutenberg, CTAN, PubMed Central open access, Xiph and Chaos Computer Club media. |
+
+`crawl --seeds seeds` and `auto` read every `.txt` file in the folder. Put your own
+lists next to them.
+
+Sites you add are **trusted**: they are never dropped for holding too little (see below).
+I could not open most of these addresses from where I wrote them, so a few may not be
+plain listings. After the first run, `opendir sites --status not_listing` and
+`--status unreachable` show which ones did not work; delete those lines.
+
 ## Finding new sites
 
-The crawler only visits sites it has been given. Discovery adds more to a list of
-sites *waiting to crawl*, which `crawl --candidates` (and `auto`) work through:
+Discovery adds more sites to a list of sites *waiting to crawl*, which
+`crawl --candidates` (and `auto`) work through:
 
-- **Links between sites (automatic).** When a listing links to a directory on
-  another site, or redirects there, that site is added to the waiting list. With
-  `--candidates` it is crawled in the same run; otherwise it waits.
-- **Common Crawl (`discover`).** Common Crawl publishes an index of billions of
-  pages it has crawled. Apache listings have sort links like `?C=N;O=D`, so their
-  URLs stand out in the index. `discover` downloads only the parts of the index
-  needed to spot them, and sends nothing to the sites themselves.
+- **Links between sites (automatic).** When a listing links to a directory on another
+  site, or redirects there, and the address looks like a public archive, that site is
+  added to the waiting list.
+- **Common Crawl (`discover`).** Common Crawl publishes an index of billions of pages it
+  has crawled. Apache listings have sort links like `?C=N;O=D`, so their URLs stand out.
+  `discover` downloads only the parts of the index needed to spot them, and sends
+  nothing to the sites themselves.
+
+Most open directories a web crawl finds are website internals, such as image and
+upload folders. Discovery therefore keeps only listings that show a sign of a public
+archive: a site name like `ftp.`, `mirror.`, `download.`, `releases.`, `.edu`, `.gov`,
+or a folder like `/pub/`, `/mirror/`, `/downloads/`, `/dist/`, `/data/` in the address.
+`--broad` turns this filter off. The `discover` progress line shows how many listings
+were kept and how many were left out.
 
 ```powershell
 # Scan 10 of the ~300 index files of the latest crawl (runs resume where they stopped).
@@ -59,19 +90,40 @@ sites *waiting to crawl*, which `crawl --candidates` (and `auto`) work through:
 
 # Crawl everything waiting, including sites found along the way, for up to 2 hours.
 .\target\release\opendir.exe crawl --candidates --hours 2
-
-.\target\release\opendir.exe stats
 ```
 
-The discover progress line shows how much it downloaded. Try `--files 1` first to
-see what one index file costs on your connection. Use `--crawl CC-MAIN-2026-30` to
-pick a specific crawl instead of the latest.
+Sites are crawled in this order: the ones you added, then ones being continued from an
+earlier run, then ones found through links, then Common Crawl finds.
+
+Try `discover --files 1` first to see what one index file costs on your connection. Use
+`--crawl CC-MAIN-2026-30` to pick a specific crawl instead of the latest.
+
+## What is kept
+
+Only sites that hold real downloads are kept. A site you did not add is dropped, and
+its listings deleted, unless it has at least **3 files of 10 MiB or more**, or at least
+**20 files of a useful kind** (disk images, archives, installers, documents, ebooks,
+audio, video, data files). Web page files (html, php, js, css, jpg, png, ...) do not
+count. The check waits until it has seen enough files: a big archive's top folders hold
+none, so it is not judged until 100 files have been seen or the site is finished.
+Change it with `--min-big`, `--min-useful`, or `--keep-all`.
+
+Sites are also dropped when a listing looks like an accidental exposure or a broken-into
+server: `.env` files, SSH keys, password stores, CMS config files, and folders of links to
+other accounts' config files on a hacked host. Weaker signs (a database dump, a dated
+backup, a scan of a passport) drop a site you did not add, and cost a site you added only
+that file. `opendir sites --status sensitive` shows what was dropped and why.
+
+Dropped sites keep only a one-line record, so they are not found and crawled again. Run
+`opendir clean` (it also runs at the start of every crawl) to apply today's rules to what
+is already stored, so the database improves when the rules do.
 
 ## Running every night (Windows)
 
 `opendir auto` is made for a scheduled task. Each run:
 
-1. adds the sites in `seeds\mirrors.txt` that were never crawled,
+1. adds the sites in the `seeds` folder that were never crawled, and tries again the
+   ones that failed before,
 2. scans 10 more Common Crawl index files (at most a quarter of the time; if Common
    Crawl can't be reached, it just skips this),
 3. crawls the waiting sites until the time is up, including sites found that night,
@@ -105,15 +157,17 @@ Useful commands: `schtasks /Run /TN "opendir nightly"` starts it now, and
 while you are logged in (a locked screen is fine). To run it when logged out, open
 the task in Task Scheduler and choose *Run whether user is logged on or not*.
 
-During the day, browse the results with `opendir search`, `opendir stats`, or a
-database browser (see below). If you use DB Browser for SQLite while a run is going,
-open the database read-only.
+## Browsing during the day
 
-## Browsing the database
-
-- `opendir search <words>` and `opendir stats` from the command line.
+- `opendir sites` lists the biggest sites; `--status paused|done|low_value|sensitive|
+  not_listing|unreachable|robots_disallowed` lists those with a status, and
+  `--sort files|recent|name` changes the order.
+- `opendir search <words>` searches file and folder names. `--ext mp3,flac` limits the
+  file type, `--min-mb 500` the size, `-n 100` shows more results.
+- `opendir stats` counts sites by status and shows what is waiting.
 - [DB Browser for SQLite](https://sqlitebrowser.org/dl/): open `opendir.db` and use
   *Browse Data* on the `files` view (every file with its full URL) and the `hosts` table.
+  If a run is going, open the database read-only.
 - [Datasette](https://datasette.io/) (needs Python): `pip install datasette`, then
   `datasette opendir.db` and open http://127.0.0.1:8001 for search and filters.
 
@@ -127,7 +181,8 @@ disappeared from the server disappear here too.
 Most of the internet's open directories are software mirrors, and most of a mirror is
 package archives: Debian and Ubuntu `pool/`, RPM `Packages/`, CRAN, CPAN and so on.
 They are legal but huge, repeated on hundreds of servers, and rarely what you are
-after. [`lists/skip.txt`](lists/skip.txt) keeps the crawler out of them:
+after. [`lists/skip.txt`](lists/skip.txt) keeps the crawler out of them, and out of
+website junk (`wp-content`, `cgi-bin`, cache and log folders) and other people's backups:
 
 - A line starting with `/` is a folder pattern, matched anywhere in a path and ignoring
   case: `/pool/` skips every folder called `pool` and everything inside it.
@@ -138,19 +193,26 @@ skipped site or folder is removed. Common Crawl finds inside skipped folders are
 turned into the site's root, so a mirror's other folders (like ISO images) still get
 crawled.
 
-If you have a database from an earlier version, opendir asks you to start a new one:
+If you have a database from an early version, opendir asks you to start a new one:
 delete `opendir.db`, `opendir.db-wal` and `opendir.db-shm`.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `auto` | The nightly job described above. Options: `--hours` (default 7), `--seeds` (default `seeds/mirrors.txt`), `--discover-files` (default 10, 0 to skip), `--crawl`, `--db`, and the crawl options below. |
-| `crawl [URL...] [--seeds FILE] [--candidates]` | Crawls the given directory URLs, and with `--candidates` every site waiting in the database (found by discovery, or paused). Options: `--hours` (time limit), `--max-sites` (sites to take from the waiting list), `--db` (default `opendir.db`), `--concurrency` (sites crawled at once, default 256), `--max-dirs` (folder budget per site per run, default 5000), `--max-depth` (default 32), `--optout` (default `lists/optout.txt`), `--skip` (default `lists/skip.txt`). |
-| `discover` | Finds listings in the Common Crawl index. Options: `--crawl` (default `latest`), `--files` (index files this run, default 10), `--parallel` (default 4), `--db`, `--skip`. |
-| `search WORDS...` | Full-text search over file and folder names. Options: `--ext iso`, `-n 50`, `--unfiltered` (show results the piracy filter hides), `--takedown` (default `lists/takedown.txt`). |
+| `auto` | The nightly job described above. Options: `--hours` (default 7), `--seeds` (a file or folder, default `seeds`), `--discover-files` (default 10, 0 to skip), `--crawl`, `--db`, and the crawl options below. |
+| `crawl [URL...] [--seeds FILE-OR-FOLDER] [--candidates]` | Crawls the given directory URLs, and with `--candidates` every site waiting in the database (found by discovery, or paused). Options: `--hours` (time limit), `--max-sites`, `--db` (default `opendir.db`). |
+| `discover` | Finds listings in the Common Crawl index. Options: `--crawl` (default `latest`), `--files` (index files this run, default 10), `--parallel` (default 4), `--db`, `--skip`, `--broad`. |
+| `search WORDS...` | Full-text search over file and folder names. Options: `--ext iso,img`, `--min-mb`, `-n 50`, `--unfiltered` (show results the piracy filter hides), `--takedown`, `--optout`. |
+| `sites` | Lists sites with status, files, size and a note. Options: `--status`, `--sort size\|files\|recent\|name`, `-n`. |
 | `stats` | Sites per crawl status with file counts and total size, what is waiting to be crawled, and why any site was dropped as sensitive. |
+| `clean` | Applies the current opt-out list, skip list, sensitive-name rules and quality check to what is stored. |
 | `forget SITE...` | Removes everything known about a site, so it is crawled or re-checked from scratch the next time it is in the seeds or found again. |
+
+Options shared by `auto`, `crawl` and `clean`: `--concurrency` (sites crawled at once,
+default 256), `--max-dirs` (folder budget per site per run, default 5000), `--max-depth`
+(default 32), `--optout` (default `lists/optout.txt`), `--skip` (default
+`lists/skip.txt`), `--broad`, `--min-big`, `--min-useful`, `--keep-all`.
 
 Everything lives in one SQLite file (`opendir.db`), so you can also query it with any
 SQLite tool.
@@ -165,11 +227,12 @@ SQLite tool.
   stay out.
 - **Stays out of private networks.** Links or redirects to `localhost`, private IP
   ranges or names like `*.local` are never added to the waiting list.
-- **Skips package archives** and anything else in `lists/skip.txt` (see above).
 - **Never downloads files.** Only pages served as HTML or JSON are read; anything else,
   including a response without a Content-Type, is skipped unread.
 - **Listing parser** for Apache, nginx (plain and fancyindex), lighttpd, IIS, Python
-  `http.server` and Caddy (asks Caddy for JSON). Pages that are not listings are skipped.
+  `http.server` and Caddy (asks Caddy for JSON). Pages with a custom title or header are
+  recognised by Apache's sort links, or by their links (a name and a date next to each).
+  Pages that are not listings are skipped.
 - **Loop guards:** a directory whose listing matches one already seen on that site (for
   example a symlink back to its parent) is indexed but not descended into. There are
   also depth, URL length and per-site budget limits.
@@ -207,8 +270,8 @@ or deletion requests, open an issue with the URLs; they go into
 
 - Common Crawl discovery recognises Apache and nginx-fancyindex listings (they have sort
   links). Plain nginx listings are found only through seeds and links.
-- Sites that failed with too many errors (`partial`) or were unreachable are not retried
-  automatically; use `forget` to retry one.
+- Sites that were unreachable or not a listing are retried only if they are in your
+  seeds. Use `forget` to retry any other one.
 - Finished sites are not re-crawled automatically yet. To refresh one, `forget` it and
   keep it in your seeds.
 - Dates are stored as the server shows them, with no time zone.

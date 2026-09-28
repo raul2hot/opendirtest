@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::{Route, listing, query_one, serve, temp_db};
 use opendirtest::crawler::{self, CrawlConfig, Pending, Stats};
+use opendirtest::quality::Thresholds;
 use opendirtest::store::{self, SearchOptions};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -23,6 +24,9 @@ fn fast_config() -> CrawlConfig {
         per_host_delay: Duration::from_millis(5),
         // The test servers live on localhost.
         allow_private_links: true,
+        // The tiny test listings would not pass the quality check; tests of the
+        // check turn it back on.
+        quality: Thresholds::OFF,
         ..CrawlConfig::default()
     }
 }
@@ -68,7 +72,7 @@ fn pending_urls(db: &Path) -> Vec<String> {
     let mut urls: Vec<String> = store::pending_hosts(&conn, 100, &Default::default())
         .unwrap()
         .into_iter()
-        .flat_map(|(_, urls)| urls.into_iter().map(String::from))
+        .flat_map(|h| h.urls.into_iter().map(String::from))
         .collect();
     urls.sort();
     urls
@@ -86,6 +90,7 @@ fn search(db: &Path, query: &str, unfiltered: bool, takedown: Vec<String>) -> Ve
     let opts = SearchOptions {
         limit: 50,
         ext: None,
+        min_bytes: None,
         unfiltered,
         takedown,
         optout: vec![],
@@ -552,6 +557,7 @@ async fn opting_out_removes_what_was_already_indexed() {
     let opts = SearchOptions {
         limit: 10,
         ext: None,
+        min_bytes: None,
         unfiltered: true,
         takedown: vec![],
         optout: optout.clone(),
@@ -677,4 +683,195 @@ async fn skip_list_cleans_up_folders_stored_before_it_was_added() {
     drop(conn);
     assert!(search(&db, "pkg", true, vec![]).is_empty());
     assert_eq!(search(&db, "disk", true, vec![]).len(), 1);
+}
+
+/// Crawls `mine` (trusted) plus the sites waiting in the database, with the quality check on.
+async fn run_judged(mine: Vec<Url>, db: &Path) {
+    let cfg = CrawlConfig {
+        quality: Thresholds::default(),
+        ..fast_config()
+    };
+    run_with_pending(mine, db, cfg).await
+}
+
+fn add_waiting(db: &Path, urls: &[Url]) {
+    store::add_candidates(&store::open(db).unwrap(), urls, "link").unwrap();
+}
+
+#[tokio::test]
+async fn sites_with_nothing_worth_keeping_are_dropped_but_your_own_are_kept() {
+    let photos: Vec<(String, u64)> = (0..30)
+        .map(|i| (format!("photo-{i}.jpg"), 40_000))
+        .collect();
+    let photos: Vec<(&str, u64)> = photos.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    let junk = serve(routes(vec![("/", listing("/", &photos))])).await;
+    let isos = [
+        ("a.iso", 4_000_000_000),
+        ("b.iso", 4_000_000_000),
+        ("c.iso", 4_000_000_000),
+    ];
+    let good = serve(routes(vec![("/", listing("/", &isos))])).await;
+    let mine = serve(routes(vec![("/", listing("/", &[("notes.txt", 12)]))])).await;
+    let db = temp_db("quality");
+    add_waiting(&db, &[junk.as_host("127.0.0.2"), good.as_host("127.0.0.3")]);
+
+    run_judged(vec![mine.base.clone()], &db).await;
+
+    // Found by a link, holding thumbnails: dropped, and nothing of it stays.
+    assert_eq!(host_status(&db, "127.0.0.2"), "low_value");
+    let reason: String = query_one(&db, "SELECT reason FROM hosts WHERE host = '127.0.0.2'");
+    assert!(reason.contains("nothing worth keeping"), "{reason}");
+    assert!(search(&db, "photo", true, vec![]).is_empty());
+    // Found by a link, holding three big disk images: kept.
+    assert_eq!(host_status(&db, "127.0.0.3"), "done");
+    assert_eq!(search(&db, "iso", true, vec![]).len(), 3);
+    // Added by you: tiny, but never judged.
+    assert_eq!(host_status(&db, "127.0.0.1"), "done");
+    assert_eq!(search(&db, "notes", true, vec![]).len(), 1);
+    let trusted: i64 = query_one(&db, "SELECT trusted FROM hosts WHERE host = '127.0.0.1'");
+    assert_eq!(trusted, 1);
+    // A dropped site is not found and crawled again.
+    let conn = store::open(&db).unwrap();
+    store::add_candidates(&conn, &[junk.as_host("127.0.0.2")], "link").unwrap();
+    assert!(pending_urls(&db).is_empty());
+}
+
+#[tokio::test]
+async fn a_new_site_full_of_junk_is_dropped_early_without_crawling_it_all() {
+    let dirs: Vec<String> = (0..150).map(|i| format!("d{i}/")).collect();
+    let root: Vec<(&str, u64)> = dirs.iter().map(|d| (d.as_str(), 0)).collect();
+    let mut site = vec![("/".to_string(), listing("/", &root))];
+    for i in 0..150 {
+        site.push((
+            format!("/d{i}/"),
+            listing(&format!("/d{i}/"), &[("t.jpg", 9_000)]),
+        ));
+    }
+    let server = serve(site.into_iter().collect()).await;
+    let db = temp_db("probe");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+
+    run_judged(vec![], &db).await;
+
+    assert_eq!(host_status(&db, "127.0.0.2"), "low_value");
+    let requested = server.requested().len();
+    assert!(
+        requested <= 105,
+        "{requested} requests: should stop after ~100 folders"
+    );
+    let files: i64 = query_one(&db, "SELECT count(*) FROM entries");
+    assert_eq!(files, 0);
+}
+
+#[tokio::test]
+async fn a_compromised_server_is_dropped_at_first_sight_even_if_you_added_it() {
+    let hacked = serve(routes(vec![
+        ("/", listing("/", &[("sym404/", 0), ("index.html", 5)])),
+        (
+            "/sym404/",
+            listing(
+                "/sym404/",
+                &[
+                    ("daemon-Wordpress26.txt404/", 0),
+                    ("dbus-BoxBilling444.txt404/", 0),
+                ],
+            ),
+        ),
+    ]))
+    .await;
+    let db = temp_db("hacked");
+
+    run_crawl(vec![hacked.base.clone()], &db, fast_config()).await;
+
+    assert_eq!(host_status(&db, "127.0.0.1"), "sensitive");
+    let reason: String = query_one(&db, "SELECT reason FROM hosts");
+    assert!(reason.contains("sym404"), "{reason}");
+    let files: i64 = query_one(&db, "SELECT count(*) FROM entries");
+    assert_eq!(files, 0);
+    assert!(search(&db, "wordpress", true, vec![]).is_empty());
+}
+
+#[tokio::test]
+async fn weak_sensitive_names_cost_your_own_site_one_entry_and_others_the_site() {
+    let files = [
+        ("backup-2026-09-01.zip", 5_000_000_000),
+        ("a.iso", 4_000_000_000),
+    ];
+    let mine = serve(routes(vec![("/", listing("/", &files))])).await;
+    let other = serve(routes(vec![("/", listing("/", &files))])).await;
+    let db = temp_db("weak");
+    add_waiting(&db, &[other.as_host("127.0.0.2")]);
+
+    run_judged(vec![mine.base.clone()], &db).await;
+
+    // Yours: only the backup file is left out.
+    assert_eq!(host_status(&db, "127.0.0.1"), "done");
+    assert_eq!(search(&db, "backup", true, vec![]).len(), 0);
+    assert_eq!(search(&db, "iso", true, vec![]).len(), 1);
+    // Found by a link: the whole site is dropped.
+    assert_eq!(host_status(&db, "127.0.0.2"), "sensitive");
+}
+
+#[tokio::test]
+async fn sites_you_add_are_crawled_before_sites_found_by_links() {
+    let db = temp_db("priority");
+    let conn = store::open(&db).unwrap();
+    let url = |u: &str| Url::parse(u).unwrap();
+    store::add_candidates(&conn, &[url("https://found.example/pub/")], "link").unwrap();
+    store::add_candidates(&conn, &[url("https://cc.example/pub/")], "commoncrawl:X").unwrap();
+    store::add_seeds(&conn, &[url("https://mine.example/pub/")]).unwrap();
+
+    let order: Vec<String> = store::pending_hosts(&conn, 10, &Default::default())
+        .unwrap()
+        .into_iter()
+        .map(|h| h.host)
+        .collect();
+    let trusted: Vec<bool> = store::pending_hosts(&conn, 10, &Default::default())
+        .unwrap()
+        .into_iter()
+        .map(|h| h.trusted)
+        .collect();
+    assert_eq!(order.len(), 3);
+    assert_eq!(order[0], "mine.example", "{order:?}");
+    assert!(trusted[0] && !trusted[1] && !trusted[2]);
+}
+
+#[tokio::test]
+async fn a_deep_archive_is_not_judged_before_its_files_are_reached() {
+    // Like a real image server: the top folders hold no files, the disk images
+    // are three levels down.
+    let isos = [
+        ("a.iso", 4_000_000_000),
+        ("b.iso", 4_000_000_000),
+        ("c.iso", 4_000_000_000),
+    ];
+    let server = serve(routes(vec![
+        ("/", listing("/", &[("releases/", 0)])),
+        ("/releases/", listing("/releases/", &[("24.04/", 0)])),
+        (
+            "/releases/24.04/",
+            listing("/releases/24.04/", &[("release/", 0)]),
+        ),
+        (
+            "/releases/24.04/release/",
+            listing("/releases/24.04/release/", &isos),
+        ),
+    ]))
+    .await;
+    let db = temp_db("deep");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+    let cfg = || CrawlConfig {
+        max_dirs_per_host: 3,
+        quality: Thresholds::default(),
+        ..fast_config()
+    };
+
+    // The first run stops after three folders, having seen no files at all.
+    run_with_pending(vec![], &db, cfg()).await;
+    assert_eq!(host_status(&db, "127.0.0.2"), "paused");
+
+    // The next run reaches the images, and the site is kept.
+    run_with_pending(vec![], &db, cfg()).await;
+    assert_eq!(host_status(&db, "127.0.0.2"), "done");
+    assert_eq!(search(&db, "iso", true, vec![]).len(), 3);
 }

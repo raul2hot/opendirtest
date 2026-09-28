@@ -1,0 +1,24 @@
+# Operating system images and releases: official servers of the projects.
+# Most are plain directory listings. Entries that are not show up as
+# "not_listing" in `opendir sites --status not_listing`; delete those lines.
+https://releases.ubuntu.com/
+https://old-releases.ubuntu.com/releases/
+https://cdimage.ubuntu.com/releases/
+https://cdimage.debian.org/debian-cd/
+https://cdimage.debian.org/cdimage/archive/
+https://get.debian.org/images/
+https://dl.fedoraproject.org/pub/fedora/linux/releases/
+https://dl.fedoraproject.org/pub/archive/fedora/linux/releases/
+https://download.rockylinux.org/pub/rocky/
+https://repo.almalinux.org/almalinux/
+https://mirrors.kernel.org/archlinux/iso/
+https://download.opensuse.org/distribution/leap/
+https://download.opensuse.org/tumbleweed/iso/
+https://download.freebsd.org/releases/ISO-IMAGES/
+https://cdn.openbsd.org/pub/OpenBSD/
+https://ftp.netbsd.org/pub/NetBSD/iso/
+https://dl-cdn.alpinelinux.org/alpine/
+https://cdimage.kali.org/
+https://iso.qubes-os.org/iso/
+https://distro.ibiblio.org/
+https://mirrors.edge.kernel.org/linuxmint/

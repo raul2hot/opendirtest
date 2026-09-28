@@ -54,6 +54,10 @@ pub struct DiscoverConfig {
     pub done_files: HashSet<String>,
     /// Finds inside skipped folders are replaced by the site's root.
     pub skip: filters::SkipList,
+    /// Keep listings that show no sign of a public archive too. Off by default:
+    /// most listings a web crawl finds are website internals (upload and image
+    /// folders), and see `filters::has_archive_signal`.
+    pub broad: bool,
     pub data_url: Url,
     pub collinfo_url: Url,
 }
@@ -66,6 +70,7 @@ impl DiscoverConfig {
             parallel,
             done_files: done,
             skip: filters::SkipList::default(),
+            broad: false,
             data_url: Url::parse(DATA_URL).unwrap(),
             collinfo_url: Url::parse(COLLINFO_URL).unwrap(),
         }
@@ -78,7 +83,10 @@ pub struct DiscoverStats {
     pub files_planned: AtomicU64,
     pub files_done: AtomicU64,
     pub files_failed: AtomicU64,
+    /// Listings kept as sites to crawl.
     pub candidates: AtomicU64,
+    /// Listings left out for showing no sign of a public archive.
+    pub rejected: AtomicU64,
     pub bytes: AtomicU64,
 }
 
@@ -132,6 +140,7 @@ pub async fn discover(
             let url = cfg.data_url.join(&path);
             let (client, stats, stop) = (client.clone(), stats.clone(), stop.clone());
             let skip = cfg.skip.clone();
+            let broad = cfg.broad;
             // Each file on its own task, so decoding uses all CPU cores.
             let scan = tokio::spawn(async move {
                 let file = HttpFile {
@@ -139,7 +148,7 @@ pub async fn discover(
                     url: url?,
                     stats,
                 };
-                scan_file(file, &skip, &stop).await
+                scan_file(file, &skip, broad, &stop).await
             });
             async move {
                 let result = match scan.await {
@@ -159,10 +168,11 @@ pub async fn discover(
         };
         let Some((path, result)) = next else { break };
         match result {
-            Ok(found) => {
+            Ok(Scan { found, rejected }) => {
                 scanned += 1;
                 stats.files_done.fetch_add(1, Relaxed);
                 stats.candidates.fetch_add(found.len() as u64, Relaxed);
+                stats.rejected.fetch_add(rejected, Relaxed);
                 // One message, so the file is only marked done together with its finds.
                 let msg = Msg::CcFileDone {
                     path,
@@ -252,11 +262,19 @@ pub fn listing_dir(url: &str) -> Option<Url> {
     url.path().ends_with('/').then_some(url)
 }
 
+/// What one index file yielded.
+struct Scan {
+    found: HashSet<Url>,
+    /// Listings left out because nothing about them suggests a public archive.
+    rejected: u64,
+}
+
 async fn scan_file(
     file: HttpFile,
     skip: &filters::SkipList,
+    broad: bool,
     stop: &CancellationToken,
-) -> Result<HashSet<Url>> {
+) -> Result<Scan> {
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(file, options).await?;
     let schema = builder.parquet_schema();
@@ -281,7 +299,10 @@ async fn scan_file(
         .with_batch_size(8192)
         .build()?;
 
-    let mut found = HashSet::new();
+    let mut scan = Scan {
+        found: HashSet::new(),
+        rejected: 0,
+    };
     loop {
         let batch = tokio::select! {
             batch = batches.try_next() => batch?,
@@ -293,17 +314,23 @@ async fn scan_file(
             let Some(dir) = listing_dir(url).filter(filters::is_public_host) else {
                 continue;
             };
-            // Also try the site's root: a site with one listing often has more.
+            // The site's root is tried too when the site's name says archive
+            // (`ftp.`, `mirror.`, `.edu`): a site with one listing often has more.
             // A find in a skipped folder (a package archive) only yields the root.
             let mut root = dir.clone();
             root.set_path("/");
-            found.insert(root);
-            if !skip.skips_folder(&dir) {
-                found.insert(dir);
+            let root_ok = broad || filters::has_archive_host(&root);
+            let dir_ok = !skip.skips_folder(&dir) && (broad || filters::has_archive_signal(&dir));
+            if root_ok {
+                scan.found.insert(root);
             }
+            if dir_ok {
+                scan.found.insert(dir);
+            }
+            scan.rejected += u64::from(!root_ok && !dir_ok);
         }
     }
-    Ok(found)
+    Ok(scan)
 }
 
 /// The values of a string column, whichever Arrow string type it was read as.

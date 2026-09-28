@@ -3,26 +3,53 @@
 //! - Sensitive exposures are checked at crawl time (`DROP_SENSITIVE_EXPOSURES`).
 //! - Likely infringement is checked at search time only.
 //! - The opt-out list is checked at crawl time, the takedown list at search time.
+//! - Whether a discovered listing looks like a public archive is checked when
+//!   it is found (`has_archive_signal`).
 
 use std::path::Path;
 use std::sync::LazyLock;
 
 use percent_encoding::percent_decode_str;
-use regex::RegexSet;
+use regex::{Regex, RegexSet};
 use url::{Host, Url};
 
-/// File or directory names that almost always mean a listing was exposed by
-/// accident. Deliberately narrow: public keys, `.pem` bundles and dataset SQL
-/// dumps (e.g. Wikimedia) are normal on legitimate mirrors.
-static SENSITIVE_NAMES: LazyLock<RegexSet> = LazyLock::new(|| {
+/// How serious a sensitive-looking name is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sensitivity {
+    /// Probably exposed by accident, but also normal on some legitimate sites
+    /// (a database dump in a dataset). A site you trust only loses that entry;
+    /// any other site is dropped.
+    Weak,
+    /// Credentials, keys, or the mark of a compromised server. The site is
+    /// dropped, whoever added it.
+    Strong,
+}
+
+/// Names that almost always mean a listing was exposed by accident, or that a
+/// server was broken into. Deliberately narrow: public keys, `.pem` bundles and
+/// dataset SQL dumps (e.g. Wikimedia) are normal on legitimate mirrors.
+static STRONG_NAMES: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)^\.env(\.[\w.-]+)?$",
         r"^id_(rsa|dsa|ecdsa|ed25519)$",
         r"(?i)^\.(git|svn|hg|ssh|aws|gnupg|bash_history|zsh_history|htpasswd)$",
         r"(?i)^wp-config\.php",
-        r"(?i)\.(kdbx|pst|ost|ppk)$",
+        r"(?i)\.(kdbx|ppk)$",
         r"(?i)^wallet\.dat$",
+        // Links to other hosting accounts' CMS config files, left in a web folder
+        // by an intruder: `<account>-Wordpress26.txt`, `<account>-BoxBilling444.txt404`.
+        r"(?i)^[a-z0-9_.-]+-(wordpress|joomla|phpbb\d*|boxbilling|whmcs|vbulletin|drupal|magento|opencart|prestashop|smf|mybb|moodle)\d*\.txt\d*$",
+    ])
+    .unwrap()
+});
+
+static WEAK_NAMES: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"(?i)\.(pst|ost)$",
         r"(?i)(backup|dump|database|mysql|db)[^/]*\.sql(\.(gz|bz2|xz|zip|7z))?$",
+        // Dated backup files, and archives of a whole web root.
+        r"(?i)^(backup|bak)[-_]?\d{4}",
+        r"(?i)^(public_html|htdocs|wwwroot)[^/]*\.(zip|tar|tgz|tar\.gz|7z|rar)$",
         // Personal documents: only as documents or scans, so that software such
         // as CRAN's `passport_0.3.0.tar.gz` package does not match.
         r"(?i)^(passport|payroll|tax[-_ ]?return|bank[-_ ]?statement)[^/]*\.(pdf|jpe?g|png|tiff?|heic|docx?|xlsx?|odt|ods)$",
@@ -30,9 +57,17 @@ static SENSITIVE_NAMES: LazyLock<RegexSet> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Listing paths that expose a home directory or the filesystem root.
-static SENSITIVE_PATHS: LazyLock<RegexSet> =
-    LazyLock::new(|| RegexSet::new([r"^/home/[^/]+/", r"^/root/", r"^/Users/[^/]+/"]).unwrap());
+/// Listing paths that expose a home directory or the filesystem root, or that
+/// are the folder of links to other accounts' config files (see above).
+static SENSITIVE_PATHS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"^/home/[^/]+/",
+        r"^/root/",
+        r"^/Users/[^/]+/",
+        r"(?i)(^|/)sym404(/|$)",
+    ])
+    .unwrap()
+});
 
 /// Release-style names that suggest pirated media or cracked software.
 /// Signals, not proof: applied only when searching, never while crawling.
@@ -47,8 +82,19 @@ static LIKELY_INFRINGING: LazyLock<RegexSet> = LazyLock::new(|| {
 });
 
 /// `name` may carry a trailing `/` for directories (Caddy does this).
+pub fn sensitivity(name: &str) -> Option<Sensitivity> {
+    let name = name.trim_end_matches('/');
+    if STRONG_NAMES.is_match(name) {
+        Some(Sensitivity::Strong)
+    } else if WEAK_NAMES.is_match(name) {
+        Some(Sensitivity::Weak)
+    } else {
+        None
+    }
+}
+
 pub fn is_sensitive_name(name: &str) -> bool {
-    SENSITIVE_NAMES.is_match(name.trim_end_matches('/'))
+    sensitivity(name).is_some()
 }
 
 /// `path` is a URL path, still percent-encoded.
@@ -212,6 +258,75 @@ impl SkipList {
     }
 }
 
+/// Host name parts that suggest a public file server or archive:
+/// `ftp.`, `mirror.`, `download.`, `releases.`, `cdimage.`, `.edu`, `.gov`, `.ac.uk`.
+static ARCHIVE_HOST_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(ftp|mirrors?|dl|downloads?|files|archives?|dist|distros?|releases?|pub|data|opendata|dumps|software|isos?|cdimage|edu|gov|ac)\d*$",
+    )
+    .unwrap()
+});
+
+/// Folder names that suggest a public file server or archive.
+static ARCHIVE_SEGMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(pub|mirrors?|dist|distrib|downloads?|dl|releases?|isos?|archives?|software|data|datasets?|ebooks?|books|library|papers|publications|linux|gnu|bsd|opendata|ftp)$",
+    )
+    .unwrap()
+});
+
+/// Hosting services where anyone picks a name under the service's domain, so a
+/// name like `files.` says nothing about the content.
+const USER_HOSTED: &[&str] = &[
+    "wordpress.com",
+    "blogspot.com",
+    "github.io",
+    "gitlab.io",
+    "netlify.app",
+    "herokuapp.com",
+    "appspot.com",
+    "pages.dev",
+    "workers.dev",
+    "vercel.app",
+    "weebly.com",
+    "wixsite.com",
+    "tumblr.com",
+    "neocities.org",
+    "000webhostapp.com",
+];
+
+fn is_user_hosted(host: &str) -> bool {
+    USER_HOSTED
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+}
+
+/// True if the site's name (`ftp.example.org`, `dl.example.com`, `example.edu`)
+/// suggests a public file server or archive.
+pub fn has_archive_host(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    !is_user_hosted(&host)
+        && host
+            .split(['.', '-'])
+            .any(|t| ARCHIVE_HOST_TOKEN.is_match(t))
+}
+
+/// True if the URL looks like part of a public archive: an archive-like site
+/// name, or a folder such as `/pub/`, `/mirror/` or `/downloads/` in the path.
+/// Discovery keeps only such listings, because most of the open directories a
+/// web crawl finds are website internals (upload folders, image folders).
+pub fn has_archive_signal(url: &Url) -> bool {
+    if is_user_hosted(&url.host_str().unwrap_or("").to_ascii_lowercase()) {
+        return false;
+    }
+    has_archive_host(url)
+        || url.path_segments().is_some_and(|mut segments| {
+            segments.any(|s| {
+                ARCHIVE_SEGMENT.is_match(&percent_decode_str(s).decode_utf8_lossy().to_lowercase())
+            })
+        })
+}
+
 /// Opt-out list entries are domains; a domain also covers its subdomains.
 pub fn host_opted_out(host: &str, optout: &[String]) -> bool {
     let host = host.to_ascii_lowercase();
@@ -285,6 +400,72 @@ mod tests {
         assert!(!is_likely_infringing("foo_1.0+repack.orig.tar.gz"));
         assert!(!is_likely_infringing("ssh-keygen.1.html"));
         assert!(!is_likely_infringing("lecture-01.mp4"));
+    }
+
+    #[test]
+    fn compromised_server_signatures() {
+        // From a real crawl: a folder of links to other accounts' config files.
+        for name in [
+            "daemon-Wordpress26.txt404/",
+            "daemon-phpBB3.txt404/",
+            "dbus-BoxBilling444.txt404/",
+            "shop-joomla2.txt",
+        ] {
+            assert_eq!(sensitivity(name), Some(Sensitivity::Strong), "{name}");
+        }
+        assert!(is_sensitive_path("/sym404/"));
+        assert!(is_sensitive_path("/pub/SYM404/daemon-Wordpress1.txt404/"));
+        assert!(!is_sensitive_path("/pub/symbols/"));
+        for name in [
+            "wordpress-6.6.zip",
+            "wordpress-plugin-1.txt-notes.tar.gz",
+            "joomla-cms-5.2.tar.gz",
+        ] {
+            assert_eq!(sensitivity(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn weak_names_only_cost_a_trusted_site_the_entry() {
+        assert_eq!(
+            sensitivity("backup-2026-09-01.zip"),
+            Some(Sensitivity::Weak)
+        );
+        assert_eq!(sensitivity("db_dump.sql.gz"), Some(Sensitivity::Weak));
+        assert_eq!(sensitivity("public_html.zip"), Some(Sensitivity::Weak));
+        assert_eq!(sensitivity("Outlook.pst"), Some(Sensitivity::Weak));
+        assert_eq!(sensitivity(".env"), Some(Sensitivity::Strong));
+        assert_eq!(sensitivity("backups.txt"), None);
+        assert_eq!(sensitivity("backup-tool-1.0.tar.gz"), None);
+    }
+
+    #[test]
+    fn archive_signals() {
+        let has = |u: &str| has_archive_signal(&Url::parse(u).unwrap());
+        for good in [
+            "https://ftp.funet.fi/pub/",
+            "https://mirror.example.edu/ubuntu/",
+            "https://download.blender.org/release/",
+            "https://old-releases.ubuntu.com/releases/",
+            "https://cdimage.debian.org/debian-cd/",
+            "https://data.example.com/x/",
+            "https://www.math.example.ac.uk/",
+            "https://nodejs.org/download/release/",
+            "https://example.org/pub/gnu/",
+            "https://example.org/Downloads/iso/",
+        ] {
+            assert!(has(good), "{good}");
+        }
+        for junk in [
+            "https://blog.example.com/wp-content/uploads/2020/05/",
+            "https://random-shop.example.com/images/",
+            "https://example.com/",
+            "http://203.0.113.9/movies/",
+            "https://foo.files.wordpress.com/",
+            "https://example.org/publish/",
+        ] {
+            assert!(!has(junk), "{junk}");
+        }
     }
 
     #[test]

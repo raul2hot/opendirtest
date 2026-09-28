@@ -504,7 +504,10 @@ Gbit/s.
 - The scheduler is one task per host plus a concurrency cap, instead of a ready-time heap.
 - Metrics are a progress line, not Prometheus.
 - Storage and search are a single SQLite file with FTS5, instead of Parquet, DuckDB and
-  Meilisearch.
+  Meilisearch. The layout stores each folder URL once and a contentless FTS index,
+  about 140 bytes per file.
+- Package archives (`pool/`, `Packages/`, CRAN, ...) are skipped through an editable
+  skip list, since they make up most of every mirror.
 - Discovery covers the Common Crawl sort-link query (§3.1, as `opendir discover`, reading
   the Parquet index with HTTP range requests instead of DuckDB) and link expansion
   (§3.6, including cross-site redirects). Censys/Shodan and CT logs are not built.

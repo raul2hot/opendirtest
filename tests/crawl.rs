@@ -603,3 +603,78 @@ async fn the_writer_waits_for_another_program_holding_the_database() {
     assert_eq!(host_status(&db, "127.0.0.1"), "done");
     assert_eq!(search(&db, "txt", true, vec![]).len(), 2);
 }
+
+#[tokio::test]
+async fn skipped_folders_and_sites_are_not_crawled() {
+    let server = serve(routes(vec![
+        ("/", listing("/", &[("ubuntu/", 0), ("notes.txt", 1)])),
+        (
+            "/ubuntu/",
+            listing("/ubuntu/", &[("pool/", 0), ("releases/", 0)]),
+        ),
+        ("/ubuntu/pool/", listing("/ubuntu/pool/", &[("main/", 0)])),
+        (
+            "/ubuntu/releases/",
+            listing("/ubuntu/releases/", &[("desktop.iso", 5)]),
+        ),
+    ]))
+    .await;
+    let db = temp_db("skip");
+    let lines = vec!["/pool/".to_string()];
+    let cfg = CrawlConfig {
+        skip: opendirtest::filters::SkipList::from_lines(&lines),
+        ..fast_config()
+    };
+
+    run_crawl(vec![server.base.clone()], &db, cfg).await;
+
+    let requested = server.requested();
+    assert!(
+        !requested.iter().any(|p| p.contains("/pool/")),
+        "{requested:?}"
+    );
+    assert_eq!(search(&db, "desktop iso", true, vec![]).len(), 1);
+    assert_eq!(host_status(&db, "127.0.0.1"), "done");
+
+    // Putting the site itself on the skip list drops what was stored.
+    let lines = vec!["127.0.0.1".to_string()];
+    let skip = opendirtest::filters::SkipList::from_lines(&lines);
+    let conn = store::open(&db).unwrap();
+    let (hosts, _) = store::apply_skip_list(&conn, &skip).unwrap();
+    assert_eq!(hosts, vec!["127.0.0.1"]);
+    drop(conn);
+    assert_eq!(host_status(&db, "127.0.0.1"), "skipped");
+    assert!(search(&db, "desktop", true, vec![]).is_empty());
+    let before = server.requested().len();
+    let cfg = CrawlConfig {
+        skip,
+        ..fast_config()
+    };
+    run_crawl(vec![server.base.clone()], &db, cfg).await;
+    assert_eq!(
+        server.requested().len(),
+        before,
+        "a skipped site gets no requests"
+    );
+}
+
+#[tokio::test]
+async fn skip_list_cleans_up_folders_stored_before_it_was_added() {
+    let server = serve(routes(vec![
+        ("/", listing("/", &[("pool/", 0), ("iso/", 0)])),
+        ("/pool/", listing("/pool/", &[("pkg_1.0.deb", 5)])),
+        ("/iso/", listing("/iso/", &[("disk.iso", 5)])),
+    ]))
+    .await;
+    let db = temp_db("skip-cleanup");
+    run_crawl(vec![server.base.clone()], &db, fast_config()).await;
+    assert_eq!(search(&db, "pkg", true, vec![]).len(), 1);
+
+    let skip = opendirtest::filters::SkipList::from_lines(&["/pool/".to_string()]);
+    let conn = store::open(&db).unwrap();
+    let (_, dirs) = store::apply_skip_list(&conn, &skip).unwrap();
+    assert_eq!(dirs, 1);
+    drop(conn);
+    assert!(search(&db, "pkg", true, vec![]).is_empty());
+    assert_eq!(search(&db, "disk", true, vec![]).len(), 1);
+}

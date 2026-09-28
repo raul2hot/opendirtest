@@ -52,6 +52,8 @@ pub struct DiscoverConfig {
     pub parallel: usize,
     /// Index files already scanned in earlier runs.
     pub done_files: HashSet<String>,
+    /// Finds inside skipped folders are replaced by the site's root.
+    pub skip: filters::SkipList,
     pub data_url: Url,
     pub collinfo_url: Url,
 }
@@ -63,6 +65,7 @@ impl DiscoverConfig {
             max_files,
             parallel,
             done_files: done,
+            skip: filters::SkipList::default(),
             data_url: Url::parse(DATA_URL).unwrap(),
             collinfo_url: Url::parse(COLLINFO_URL).unwrap(),
         }
@@ -128,6 +131,7 @@ pub async fn discover(
         .map(|path| {
             let url = cfg.data_url.join(&path);
             let (client, stats, stop) = (client.clone(), stats.clone(), stop.clone());
+            let skip = cfg.skip.clone();
             // Each file on its own task, so decoding uses all CPU cores.
             let scan = tokio::spawn(async move {
                 let file = HttpFile {
@@ -135,7 +139,7 @@ pub async fn discover(
                     url: url?,
                     stats,
                 };
-                scan_file(file, &stop).await
+                scan_file(file, &skip, &stop).await
             });
             async move {
                 let result = match scan.await {
@@ -248,7 +252,11 @@ pub fn listing_dir(url: &str) -> Option<Url> {
     url.path().ends_with('/').then_some(url)
 }
 
-async fn scan_file(file: HttpFile, stop: &CancellationToken) -> Result<HashSet<Url>> {
+async fn scan_file(
+    file: HttpFile,
+    skip: &filters::SkipList,
+    stop: &CancellationToken,
+) -> Result<HashSet<Url>> {
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(file, options).await?;
     let schema = builder.parquet_schema();
@@ -282,7 +290,15 @@ async fn scan_file(file: HttpFile, stop: &CancellationToken) -> Result<HashSet<U
         let Some(batch) = batch else { break };
         for url in strings(batch.column(0).as_ref())?.into_iter().flatten() {
             // A public index can still point at private addresses; skip those.
-            if let Some(dir) = listing_dir(url).filter(filters::is_public_host) {
+            let Some(dir) = listing_dir(url).filter(filters::is_public_host) else {
+                continue;
+            };
+            // Also try the site's root: a site with one listing often has more.
+            // A find in a skipped folder (a package archive) only yields the root.
+            let mut root = dir.clone();
+            root.set_path("/");
+            found.insert(root);
+            if !skip.skips_folder(&dir) {
                 found.insert(dir);
             }
         }

@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
+use percent_encoding::percent_decode_str;
 use regex::RegexSet;
 use url::{Host, Url};
 
@@ -158,6 +159,59 @@ pub fn normalize_url_prefix(prefix: &str) -> String {
     Url::parse(prefix).map_or_else(|_| prefix.to_string(), String::from)
 }
 
+/// Sites and folders the crawler leaves alone (`lists/skip.txt`): by default
+/// the big software package archives that mirrors are full of.
+#[derive(Clone, Debug, Default)]
+pub struct SkipList {
+    hosts: Vec<String>,
+    /// Lower-case folder patterns such as `/pool/`, matched anywhere in a path.
+    folders: Vec<String>,
+}
+
+impl SkipList {
+    /// Lines starting with `/` are folder patterns; any other line is a site.
+    pub fn from_lines(lines: &[String]) -> Self {
+        let mut list = SkipList::default();
+        for line in lines {
+            if line.starts_with('/') {
+                let mut folder = line.to_lowercase();
+                if !folder.ends_with('/') {
+                    folder.push('/');
+                }
+                list.folders.push(folder);
+            } else {
+                list.hosts.push(normalize_domain(line));
+            }
+        }
+        list
+    }
+
+    pub fn hosts(&self) -> &[String] {
+        &self.hosts
+    }
+
+    pub fn has_folders(&self) -> bool {
+        !self.folders.is_empty()
+    }
+
+    pub fn skips_host(&self, host: &str) -> bool {
+        host_opted_out(host, &self.hosts)
+    }
+
+    /// True if the URL is a skipped folder or inside one.
+    pub fn skips_folder(&self, url: &Url) -> bool {
+        if self.folders.is_empty() {
+            return false;
+        }
+        let path = percent_decode_str(url.path())
+            .decode_utf8_lossy()
+            .to_lowercase();
+        self.folders
+            .iter()
+            .any(|folder| path.contains(folder.as_str()))
+    }
+}
+
 /// Opt-out list entries are domains; a domain also covers its subdomains.
 pub fn host_opted_out(host: &str, optout: &[String]) -> bool {
     let host = host.to_ascii_lowercase();
@@ -299,6 +353,25 @@ mod tests {
             normalize_url_prefix("HTTPS://H.Example:443/pub/my file"),
             "https://h.example/pub/my%20file"
         );
+    }
+
+    #[test]
+    fn skip_list() {
+        let lines: Vec<String> = ["/pool/", "/src/contrib", "cran.r-project.org"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let skip = SkipList::from_lines(&lines);
+        let folder = |u: &str| skip.skips_folder(&Url::parse(u).unwrap());
+        assert!(folder("https://mirror.example.edu/ubuntu/pool/"));
+        assert!(folder("https://mirror.example.edu/ubuntu/pool/main/p/"));
+        assert!(folder("https://mirror.example.edu/cran/src/contrib/"));
+        assert!(folder("https://mirror.example.edu/POOL/"), "ignores case");
+        assert!(!folder("https://mirror.example.edu/ubuntu/"));
+        assert!(!folder("https://mirror.example.edu/whirlpool/"));
+        assert!(skip.skips_host("cran.r-project.org"));
+        assert!(!skip.skips_host("cloud.r-project.org"));
+        assert!(!skip.skips_host("r-project.org"));
     }
 
     #[test]

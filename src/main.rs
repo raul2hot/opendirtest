@@ -78,6 +78,9 @@ enum Command {
         parallel: usize,
         #[arg(long, default_value = "opendir.db")]
         db: PathBuf,
+        /// Skip list: finds in skipped folders only add the site's root
+        #[arg(long, default_value = "lists/skip.txt")]
+        skip: PathBuf,
     },
     /// Search the index
     Search {
@@ -120,13 +123,16 @@ struct CrawlArgs {
     #[arg(long, default_value_t = 256)]
     concurrency: usize,
     /// Directory budget per site per run; the rest continues next run
-    #[arg(long, default_value_t = 20_000)]
+    #[arg(long, default_value_t = 5_000)]
     max_dirs: u64,
     #[arg(long, default_value_t = 32)]
     max_depth: usize,
     /// Opt-out list: one domain per line
     #[arg(long, default_value = "lists/optout.txt")]
     optout: PathBuf,
+    /// Skip list: sites and folder patterns not to crawl
+    #[arg(long, default_value = "lists/skip.txt")]
+    skip: PathBuf,
 }
 
 #[tokio::main]
@@ -172,8 +178,10 @@ async fn main() -> Result<()> {
             files,
             parallel,
             db,
+            skip,
         } => {
-            run_discover(crawl, files, parallel, &db, stop_on_ctrl_c()).await?;
+            let skip = load_skip(&skip)?;
+            run_discover(crawl, files, parallel, skip, &db, stop_on_ctrl_c()).await?;
             eprintln!("Next: opendir crawl --candidates --db {}", db.display());
             Ok(())
         }
@@ -269,7 +277,8 @@ async fn run_auto(
             quarter.cancel();
         });
         // A night without Common Crawl is still a useful night of crawling.
-        if let Err(e) = run_discover(crawl, discover_files, 4, &db, discover_stop).await {
+        let skip = cfg.skip.clone();
+        if let Err(e) = run_discover(crawl, discover_files, 4, skip, &db, discover_stop).await {
             eprintln!("Discovery skipped: {e:#}");
         }
     }
@@ -300,13 +309,19 @@ fn load_optout(path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+fn load_skip(path: &Path) -> Result<filters::SkipList> {
+    Ok(filters::SkipList::from_lines(&load_list_or_warn(
+        path, "skip",
+    )?))
+}
+
 fn crawl_config(args: &CrawlArgs) -> Result<CrawlConfig> {
-    let optout = load_optout(&args.optout)?;
     Ok(CrawlConfig {
         concurrency: args.concurrency,
         max_dirs_per_host: args.max_dirs,
         max_depth: args.max_depth,
-        optout,
+        optout: load_optout(&args.optout)?,
+        skip: load_skip(&args.skip)?,
         ..CrawlConfig::default()
     })
 }
@@ -389,11 +404,19 @@ async fn run_crawl(
     progress_every: Duration,
 ) -> Result<()> {
     let conn = store::open(db)?;
-    // Sites that opted out since they were crawled: keep only the status.
+    // Sites that opted out or were added to the skip list since they were
+    // crawled: keep only their status.
     for host in store::apply_optout(&conn, &cfg.optout)? {
         eprintln!("Removed {host}: it is on the opt-out list");
     }
-    cfg.skip_hosts = store::sensitive_hosts(&conn)?.into_iter().collect();
+    let (skipped_hosts, skipped_dirs) = store::apply_skip_list(&conn, &cfg.skip)?;
+    for host in skipped_hosts {
+        eprintln!("Removed {host}: it is on the skip list");
+    }
+    if skipped_dirs > 0 {
+        eprintln!("Removed {skipped_dirs} stored listings inside skipped folders");
+    }
+    cfg.sensitive_hosts = store::sensitive_hosts(&conn)?.into_iter().collect();
     drop(conn);
     let (tx, writer) = store::spawn_writer(db.to_path_buf())?;
     let stats = Arc::new(Stats::default());
@@ -418,11 +441,13 @@ async fn run_discover(
     crawl: String,
     files: usize,
     parallel: usize,
+    skip: filters::SkipList,
     db: &Path,
     stop: CancellationToken,
 ) -> Result<DiscoverSummary> {
     let done = store::done_cc_files(&store::open(db)?)?;
-    let cfg = DiscoverConfig::new(crawl, files, parallel, done);
+    let mut cfg = DiscoverConfig::new(crawl, files, parallel, done);
+    cfg.skip = skip;
     let (tx, writer) = store::spawn_writer(db.to_path_buf())?;
     let stats = Arc::new(DiscoverStats::default());
     let started = Instant::now();

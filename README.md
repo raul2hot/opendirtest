@@ -20,8 +20,9 @@ look like accidental leaks.
    cargo build --release
    ```
 
-3. Crawl the bundled list of official mirrors. `--max-dirs 500` keeps the first run to
-   roughly 10 minutes (longer for sites whose robots.txt asks for a slower pace):
+3. Crawl the bundled starting points (official operating system release servers).
+   `--max-dirs 500` keeps the first run to roughly 10 minutes (longer for sites whose
+   robots.txt asks for a slower pace):
 
    ```powershell
    .\target\release\opendir.exe crawl --seeds seeds\mirrors.txt --max-dirs 500
@@ -32,7 +33,7 @@ look like accidental leaks.
    ```powershell
    .\target\release\opendir.exe search ubuntu desktop --ext iso
    .\target\release\opendir.exe search debian netinst -n 50
-   .\target\release\opendir.exe search linux --ext xz
+   .\target\release\opendir.exe search fedora workstation --ext iso
    .\target\release\opendir.exe stats
    ```
 
@@ -77,9 +78,9 @@ pick a specific crawl instead of the latest.
 4. stops cleanly. Sites it didn't finish are marked `paused`, and the next run
    carries on from where they stopped, without re-fetching what it already has.
 
-Each site also has a budget of 20,000 directories per run (`--max-dirs`). A bigger
-mirror is paused at that point and continues the next night, so one huge site
-can't take a whole night's slot.
+Each site also has a budget of 5,000 folders per run (`--max-dirs`). A bigger site
+is paused at that point and continues the next night, so one huge site can't take
+a whole night's slot.
 
 `nightly.bat` in the project folder runs `auto --hours 7` and appends its output to
 `logs\nightly.log`. Change the hours in it to fit your night. To set it up:
@@ -112,17 +113,41 @@ open the database read-only.
 
 - `opendir search <words>` and `opendir stats` from the command line.
 - [DB Browser for SQLite](https://sqlitebrowser.org/dl/): open `opendir.db` and use
-  *Browse Data* on the `entries` and `hosts` tables.
+  *Browse Data* on the `files` view (every file with its full URL) and the `hosts` table.
 - [Datasette](https://datasette.io/) (needs Python): `pip install datasette`, then
   `datasette opendir.db` and open http://127.0.0.1:8001 for search and filters.
+
+## What gets stored, and how much
+
+Only names, sizes and dates, about **140 bytes per file**: a million files take about
+140 MB. Each folder's URL is stored once, and the search index keeps no copy of the
+text. Reading a folder again replaces what was stored for it, so files that
+disappeared from the server disappear here too.
+
+Most of the internet's open directories are software mirrors, and most of a mirror is
+package archives: Debian and Ubuntu `pool/`, RPM `Packages/`, CRAN, CPAN and so on.
+They are legal but huge, repeated on hundreds of servers, and rarely what you are
+after. [`lists/skip.txt`](lists/skip.txt) keeps the crawler out of them:
+
+- A line starting with `/` is a folder pattern, matched anywhere in a path and ignoring
+  case: `/pool/` skips every folder called `pool` and everything inside it.
+- Any other line is a site, e.g. `cran.r-project.org` (its subdomains too).
+
+The list is yours to edit. At the start of each crawl, anything already stored for a
+skipped site or folder is removed. Common Crawl finds inside skipped folders are
+turned into the site's root, so a mirror's other folders (like ISO images) still get
+crawled.
+
+If you have a database from an earlier version, opendir asks you to start a new one:
+delete `opendir.db`, `opendir.db-wal` and `opendir.db-shm`.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `auto` | The nightly job described above. Options: `--hours` (default 7), `--seeds` (default `seeds/mirrors.txt`), `--discover-files` (default 10, 0 to skip), `--crawl`, `--db`, and the crawl options below. |
-| `crawl [URL...] [--seeds FILE] [--candidates]` | Crawls the given directory URLs, and with `--candidates` every site waiting in the database (found by discovery, or paused). Options: `--hours` (time limit), `--max-sites` (sites to take from the waiting list), `--db` (default `opendir.db`), `--concurrency` (sites crawled at once, default 256), `--max-dirs` (directory budget per site per run, default 20000), `--max-depth` (default 32), `--optout` (default `lists/optout.txt`). |
-| `discover` | Finds listings in the Common Crawl index. Options: `--crawl` (default `latest`), `--files` (index files this run, default 10), `--parallel` (default 4), `--db`. |
+| `crawl [URL...] [--seeds FILE] [--candidates]` | Crawls the given directory URLs, and with `--candidates` every site waiting in the database (found by discovery, or paused). Options: `--hours` (time limit), `--max-sites` (sites to take from the waiting list), `--db` (default `opendir.db`), `--concurrency` (sites crawled at once, default 256), `--max-dirs` (folder budget per site per run, default 5000), `--max-depth` (default 32), `--optout` (default `lists/optout.txt`), `--skip` (default `lists/skip.txt`). |
+| `discover` | Finds listings in the Common Crawl index. Options: `--crawl` (default `latest`), `--files` (index files this run, default 10), `--parallel` (default 4), `--db`, `--skip`. |
 | `search WORDS...` | Full-text search over file and folder names. Options: `--ext iso`, `-n 50`, `--unfiltered` (show results the piracy filter hides), `--takedown` (default `lists/takedown.txt`). |
 | `stats` | Sites per crawl status with file counts and total size, what is waiting to be crawled, and why any site was dropped as sensitive. |
 | `forget SITE...` | Removes everything known about a site, so it is crawled or re-checked from scratch the next time it is in the seeds or found again. |
@@ -140,6 +165,7 @@ SQLite tool.
   stay out.
 - **Stays out of private networks.** Links or redirects to `localhost`, private IP
   ranges or names like `*.local` are never added to the waiting list.
+- **Skips package archives** and anything else in `lists/skip.txt` (see above).
 - **Never downloads files.** Only pages served as HTML or JSON are read; anything else,
   including a response without a Content-Type, is skipped unread.
 - **Listing parser** for Apache, nginx (plain and fancyindex), lighttpd, IIS, Python
@@ -173,8 +199,9 @@ Disallow: /
 
 You can also open an issue on this repository to have your domain added to
 [`lists/optout.txt`](lists/optout.txt). A site on that list is hidden from search at
-once, and its indexed files are deleted at the start of the next crawl. For takedown or deletion requests, open an
-issue with the URLs; they go into [`lists/takedown.txt`](lists/takedown.txt).
+once, and its indexed files are deleted at the start of the next crawl. For takedown
+or deletion requests, open an issue with the URLs; they go into
+[`lists/takedown.txt`](lists/takedown.txt).
 
 ## Limits
 
@@ -182,8 +209,8 @@ issue with the URLs; they go into [`lists/takedown.txt`](lists/takedown.txt).
   links). Plain nginx listings are found only through seeds and links.
 - Sites that failed with too many errors (`partial`) or were unreachable are not retried
   automatically; use `forget` to retry one.
-- A new crawl re-fetches everything. Entries that disappeared from a site stay in the
-  database until you delete the database file.
+- Finished sites are not re-crawled automatically yet. To refresh one, `forget` it and
+  keep it in your seeds.
 - Dates are stored as the server shows them, with no time zone.
 - JavaScript-based listers (h5ai, AList, File Browser) and Go's bare `http.FileServer`
   pages are not recognised.

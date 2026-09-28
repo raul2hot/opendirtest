@@ -65,7 +65,9 @@ pub struct CrawlConfig {
     /// Domains whose owners opted out.
     pub optout: Vec<String>,
     /// Hosts dropped as sensitive exposures in earlier runs.
-    pub skip_hosts: HashSet<String>,
+    pub sensitive_hosts: HashSet<String>,
+    /// Sites and folders not to crawl (`lists/skip.txt`).
+    pub skip: filters::SkipList,
     /// Record links to local and private-network hosts as sites to crawl.
     /// Only for tests against local servers.
     pub allow_private_links: bool,
@@ -75,11 +77,12 @@ impl Default for CrawlConfig {
     fn default() -> Self {
         Self {
             concurrency: 256,
-            max_dirs_per_host: 20_000,
+            max_dirs_per_host: 5_000,
             max_depth: 32,
             per_host_delay: Duration::from_secs(1),
             optout: Vec::new(),
-            skip_hosts: HashSet::new(),
+            sensitive_hosts: HashSet::new(),
+            skip: filters::SkipList::default(),
             allow_private_links: false,
         }
     }
@@ -377,11 +380,33 @@ impl HostCrawl {
                 purge: true,
             });
         }
-        if DROP_SENSITIVE_EXPOSURES && self.cfg.skip_hosts.contains(&self.host) {
+        if DROP_SENSITIVE_EXPOSURES && self.cfg.sensitive_hosts.contains(&self.host) {
             return None; // keeps the reason recorded when it was dropped
+        }
+        if self.cfg.skip.skips_host(&self.host) {
+            return Some(Report {
+                status: HostStatus::Skipped,
+                server: None,
+                dirs: 0,
+                reason: Some("on the skip list".into()),
+                purge: true,
+            });
         }
 
         let started_from = seeds.clone();
+        let seeds: Vec<Url> = seeds
+            .into_iter()
+            .filter(|u| !self.cfg.skip.skips_folder(u))
+            .collect();
+        if seeds.is_empty() {
+            return Some(Report {
+                status: HostStatus::Done,
+                server: None,
+                dirs: 0,
+                reason: Some("nothing to crawl outside skipped folders".into()),
+                purge: false,
+            });
+        }
         let mut queue: VecDeque<(Url, usize)> = seeds.into_iter().map(|u| (u, 0)).collect();
         let mut seen: HashSet<String> = queue.iter().map(|(u, _)| u.to_string()).collect();
         let mut listing_hashes = HashSet::new();
@@ -477,6 +502,7 @@ impl HostCrawl {
                     if depth < self.cfg.max_depth
                         && dir.as_str().len() <= MAX_URL_LEN
                         && !has_repeating_segments(dir.path())
+                        && !self.cfg.skip.skips_folder(&dir)
                         && seen.insert(dir.to_string())
                     {
                         if queue.len() as u64 + dirs < self.cfg.max_dirs_per_host {

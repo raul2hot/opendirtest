@@ -1,0 +1,24 @@
+# Sites and folders the crawler leaves alone. Edit freely: changes apply at the
+# next crawl, which also removes anything already stored for them.
+#
+# A line starting with / is a folder pattern, matched anywhere in a URL path and
+# ignoring case: /pool/ skips every folder called "pool" and everything in it.
+# Any other line is a site: example.org (also covers its subdomains).
+
+# Software package archives. They are huge, copied on hundreds of mirror
+# servers, and rarely what you are looking for. Delete a line to crawl them.
+/pool/                  # Debian and Ubuntu packages
+/dists/                 # Debian and Ubuntu package indexes
+/indices/               # Ubuntu package override files
+/repodata/              # RPM repositories: Fedora, CentOS, RHEL, openSUSE
+/Packages/              # RPM package folders
+/SRPMS/                 # source RPMs
+/debug/                 # debug-symbol packages
+/src/contrib/           # CRAN (R) packages
+/bin/windows/contrib/   # CRAN (R) Windows builds
+/bin/macosx/            # CRAN (R) macOS builds
+/web/packages/          # CRAN and PyPI package pages
+/web/checks/            # CRAN check results
+/authors/id/            # CPAN (Perl)
+/maven2/                # Maven (Java)
+/distfiles/             # Gentoo and BSD source caches

@@ -98,6 +98,12 @@ async fn fake_common_crawl() -> (common::Server, usize) {
             "https://mirror.example.net/data/?C=N&O=A",
             "C=N&O=A",
         ),
+        // A package pool on a distro mirror: on the skip list.
+        (
+            180_000,
+            "https://deb.example.edu/ubuntu/pool/main/?C=M;O=A",
+            "C=M;O=A",
+        ),
         // Sort-like query on a page that is not a directory: ignored.
         (
             170_501,
@@ -139,6 +145,7 @@ async fn fake_common_crawl() -> (common::Server, usize) {
 
 fn config(server: &common::Server, max_files: usize, done: HashSet<String>) -> DiscoverConfig {
     let mut cfg = DiscoverConfig::new("latest".into(), max_files, 2, done);
+    cfg.skip = opendirtest::filters::SkipList::from_lines(&["/pool/".to_string()]);
     cfg.data_url = server.base.clone();
     cfg.collinfo_url = server.base.join("collinfo.json").unwrap();
     cfg
@@ -179,8 +186,12 @@ async fn finds_listings_reading_only_a_fraction_of_the_index() {
     assert_eq!(
         found,
         vec![
+            // Each site's root is tried too; the skipped pool only yields its root.
+            "https://deb.example.edu/",
+            "https://ftp.example.org/",
             "https://ftp.example.org/pub/",
             "https://ftp.example.org/pub/linux/",
+            "https://mirror.example.net/",
             "https://mirror.example.net/data/"
         ]
     );

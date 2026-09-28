@@ -1,11 +1,15 @@
-//! SQLite storage: one file holds the entries, per-host crawl results, a
-//! full-text index (FTS5) over file names and directory paths, and the
-//! discovery candidates waiting to be crawled.
+//! SQLite storage: one file holds the listings, per-host crawl results, a
+//! full-text index (FTS5) over file names and folder paths, and the sites
+//! waiting to be crawled.
+//!
+//! The layout is compact (about 130 bytes per file): a folder's URL is stored
+//! once in `dirs`, each file only by name in `entries`, and the search index
+//! keeps no copy of the text. The `files` view puts full URLs back together.
 //!
 //! The crawler never touches SQLite directly. It sends messages to a single
 //! writer thread, which batches them into transactions.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,31 +39,38 @@ CREATE TABLE IF NOT EXISTS hosts (
     reason     TEXT
 );
 
-CREATE TABLE IF NOT EXISTS entries (
-    url     TEXT PRIMARY KEY,
+-- One row per folder listing that was read.
+CREATE TABLE IF NOT EXISTS dirs (
+    id      INTEGER PRIMARY KEY,
     host    TEXT NOT NULL,
-    dir     TEXT NOT NULL,
-    name    TEXT NOT NULL,
-    is_dir  INTEGER NOT NULL,
-    size    INTEGER,
-    mtime   TEXT,
+    url     TEXT NOT NULL UNIQUE,
     seen_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS entries_host ON entries(host);
+CREATE INDEX IF NOT EXISTS dirs_host ON dirs(host);
 
+-- One row per file or folder in a listing. Its URL is the folder's URL plus
+-- `href` (the name as written in the link), or plus `name` when `href` is null.
+CREATE TABLE IF NOT EXISTS entries (
+    id     INTEGER PRIMARY KEY,
+    dir_id INTEGER NOT NULL,
+    name   TEXT NOT NULL,
+    href   TEXT,
+    is_dir INTEGER NOT NULL,
+    size   INTEGER,
+    mtime  TEXT
+);
+CREATE INDEX IF NOT EXISTS entries_dir ON entries(dir_id);
+
+-- Search index over names and folder paths. It stores no copy of the text.
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts
-    USING fts5(name, dir, content='entries', content_rowid='rowid');
+    USING fts5(name, path, content='', contentless_delete=1);
 
-CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
-    INSERT INTO entries_fts(rowid, name, dir) VALUES (new.rowid, new.name, new.dir);
-END;
-CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
-    INSERT INTO entries_fts(entries_fts, rowid, name, dir) VALUES ('delete', old.rowid, old.name, old.dir);
-END;
-CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
-    INSERT INTO entries_fts(entries_fts, rowid, name, dir) VALUES ('delete', old.rowid, old.name, old.dir);
-    INSERT INTO entries_fts(rowid, name, dir) VALUES (new.rowid, new.name, new.dir);
-END;
+-- Every file and folder with its full URL, for browsing with DB Browser or Datasette.
+CREATE VIEW IF NOT EXISTS files AS
+SELECT d.host AS host,
+       d.url || coalesce(e.href, e.name) || CASE WHEN e.is_dir THEN '/' ELSE '' END AS url,
+       e.name AS name, e.is_dir AS is_dir, e.size AS size, e.mtime AS mtime
+FROM entries e JOIN dirs d ON d.id = e.dir_id;
 
 -- Work still to do: directory URLs to crawl, found by discovery or saved when a
 -- crawl was paused. A host's rows are removed once it is finished.
@@ -87,6 +98,8 @@ pub enum HostStatus {
     /// Stopped by the time limit, Ctrl-C or the per-run directory budget. The
     /// directories still to do are saved as candidates; the next run continues.
     Paused,
+    /// On the skip list: not crawled, and nothing stored.
+    Skipped,
     /// Given up after too many errors in a row.
     Partial,
     RobotsDisallowed,
@@ -101,6 +114,7 @@ impl HostStatus {
         match self {
             HostStatus::Done => "done",
             HostStatus::Paused => "paused",
+            HostStatus::Skipped => "skipped",
             HostStatus::Partial => "partial",
             HostStatus::RobotsDisallowed => "robots_disallowed",
             HostStatus::NotListing => "not_listing",
@@ -123,7 +137,8 @@ pub enum Msg {
         dirs: u64,
         /// Why the host was skipped or dropped, e.g. the file that looked sensitive.
         reason: Option<String>,
-        /// Delete the host's entries too (dropped as sensitive, or opted out).
+        /// Delete what was stored for the host (dropped as sensitive, opted out,
+        /// or skipped).
         purge: bool,
     },
     /// Directory URLs worth crawling later. Already-known URLs are ignored.
@@ -156,16 +171,21 @@ pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     // Wait for other programs (e.g. a DB browser) instead of failing straight away.
     conn.busy_timeout(Duration::from_secs(60))?;
-    conn.execute_batch(SCHEMA)?;
-    // Databases created by v1 lack `hosts.reason`.
-    let has_reason: bool = conn.query_row(
-        "SELECT count(*) FROM pragma_table_info('hosts') WHERE name = 'reason'",
+    // Earlier versions stored each file's full URL (about 3x the space).
+    let old_layout: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('entries') WHERE name = 'url'",
         [],
         |row| row.get(0),
     )?;
-    if !has_reason {
-        conn.execute_batch("ALTER TABLE hosts ADD COLUMN reason TEXT")?;
+    if old_layout {
+        bail!(
+            "{} was made by an older version of opendir, with a bigger storage layout. \
+             Delete it (and its -wal and -shm files) to start a new database, or pass \
+             --db with a new file name.",
+            path.display()
+        );
     }
+    conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }
 
@@ -266,30 +286,7 @@ fn is_busy(e: &rusqlite::Error) -> bool {
 fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
     let now = unix_now();
     match msg {
-        Msg::Entries { host, entries } => {
-            let mut stmt = conn.prepare_cached(
-                "INSERT INTO entries (url, host, dir, name, is_dir, size, mtime, seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(url) DO UPDATE SET
-                    name = excluded.name, is_dir = excluded.is_dir, size = excluded.size,
-                    mtime = excluded.mtime, seen_at = excluded.seen_at",
-            )?;
-            for e in entries {
-                let path = e.url.path();
-                let parent = &path[..path.trim_end_matches('/').rfind('/').map_or(0, |i| i + 1)];
-                let dir = percent_decode_str(parent).decode_utf8_lossy();
-                stmt.execute(params![
-                    e.url.as_str(),
-                    host,
-                    dir,
-                    e.name,
-                    e.is_dir,
-                    e.size.map(|s| s as i64),
-                    e.mtime,
-                    now
-                ])?;
-            }
-        }
+        Msg::Entries { host, entries } => store_listing(conn, host, entries, now)?,
         Msg::HostDone {
             host,
             status,
@@ -299,12 +296,13 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
             purge,
         } => {
             if *purge {
-                conn.execute("DELETE FROM entries WHERE host = ?1", [host])?;
+                purge_host(conn, host)?;
             }
             conn.execute(
                 "INSERT INTO hosts (host, status, server, dirs, files, bytes, crawled_at, reason)
-                 SELECT ?1, ?2, ?3, ?4, count(*), CAST(total(size) AS INTEGER), ?5, ?6
-                 FROM entries WHERE host = ?1 AND is_dir = 0
+                 SELECT ?1, ?2, ?3, ?4, count(e.id), CAST(total(e.size) AS INTEGER), ?5, ?6
+                 FROM dirs d JOIN entries e ON e.dir_id = d.id AND e.is_dir = 0
+                 WHERE d.host = ?1
                  ON CONFLICT(host) DO UPDATE SET
                     status = excluded.status, server = coalesce(excluded.server, hosts.server),
                     dirs = excluded.dirs
@@ -347,6 +345,83 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Stores one listing. A listing read again replaces what was stored for it,
+/// so files that disappeared from the server disappear here too.
+fn store_listing(conn: &Connection, host: &str, entries: &[Entry], now: i64) -> Result<()> {
+    // Folder URL -> (id, decoded path for the search index). All entries of a
+    // listing share one folder, but don't rely on it.
+    let mut dirs: HashMap<String, (i64, String)> = HashMap::new();
+    let mut add_entry = conn.prepare_cached(
+        "INSERT INTO entries (dir_id, name, href, is_dir, size, mtime) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut add_to_index =
+        conn.prepare_cached("INSERT INTO entries_fts (rowid, name, path) VALUES (?1, ?2, ?3)")?;
+    for e in entries {
+        let (dir_url, href) = split_url(&e.url);
+        if !dirs.contains_key(&dir_url) {
+            let id: i64 = conn.query_row(
+                "INSERT INTO dirs (host, url, seen_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(url) DO UPDATE SET seen_at = excluded.seen_at
+                 RETURNING id",
+                params![host, dir_url, now],
+                |row| row.get(0),
+            )?;
+            delete_dir_entries(conn, id)?;
+            let path = Url::parse(&dir_url).map_or(String::new(), |u| {
+                percent_decode_str(u.path())
+                    .decode_utf8_lossy()
+                    .into_owned()
+            });
+            dirs.insert(dir_url.clone(), (id, path));
+        }
+        let (dir_id, path) = &dirs[&dir_url];
+        let href = (href != e.name).then_some(href);
+        add_entry.execute(params![
+            dir_id,
+            e.name,
+            href,
+            e.is_dir,
+            e.size.map(|s| s as i64),
+            e.mtime
+        ])?;
+        add_to_index.execute(params![conn.last_insert_rowid(), e.name, path])?;
+    }
+    Ok(())
+}
+
+/// A file's folder URL (ending in `/`) and its name as written in the URL,
+/// without the trailing `/` of folders.
+fn split_url(url: &Url) -> (String, String) {
+    let s = url.as_str();
+    let s = s.strip_suffix('/').unwrap_or(s);
+    let cut = s.rfind('/').map_or(0, |i| i + 1);
+    (s[..cut].to_string(), s[cut..].to_string())
+}
+
+fn delete_dir_entries(conn: &Connection, dir_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM entries_fts WHERE rowid IN (SELECT id FROM entries WHERE dir_id = ?1)",
+        [dir_id],
+    )?;
+    conn.execute("DELETE FROM entries WHERE dir_id = ?1", [dir_id])?;
+    Ok(())
+}
+
+/// Deletes every listing stored for a host. Returns how many files that was.
+fn purge_host(conn: &Connection, host: &str) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM entries_fts WHERE rowid IN (
+             SELECT e.id FROM entries e JOIN dirs d ON d.id = e.dir_id WHERE d.host = ?1)",
+        [host],
+    )?;
+    let files = conn.execute(
+        "DELETE FROM entries WHERE dir_id IN (SELECT id FROM dirs WHERE host = ?1)",
+        [host],
+    )?;
+    conn.execute("DELETE FROM dirs WHERE host = ?1", [host])?;
+    Ok(files)
 }
 
 // ---------------------------------------------------------------------------
@@ -419,27 +494,67 @@ pub fn pending_hosts(
 /// Drops every known host that is on the opt-out list: its entries and waiting
 /// work are deleted and only the `opted_out` status is kept. Returns them.
 pub fn apply_optout(conn: &Connection, optout: &[String]) -> Result<Vec<String>> {
-    if !HONOR_OPT_OUT_LIST || optout.is_empty() {
+    if !HONOR_OPT_OUT_LIST {
+        return Ok(Vec::new());
+    }
+    drop_listed_hosts(conn, optout, HostStatus::OptedOut, "on the opt-out list")
+}
+
+/// Applies the skip list to what is already stored: sites on it are dropped
+/// like opted-out ones, and listings inside skipped folders are deleted.
+/// Returns the sites dropped and the number of listings deleted.
+pub fn apply_skip_list(
+    conn: &Connection,
+    skip: &filters::SkipList,
+) -> Result<(Vec<String>, usize)> {
+    let hosts = drop_listed_hosts(conn, skip.hosts(), HostStatus::Skipped, "on the skip list")?;
+    if !skip.has_folders() {
+        return Ok((hosts, 0));
+    }
+    let mut stmt = conn.prepare("SELECT id, url FROM dirs")?;
+    let skipped: Vec<i64> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|row| row.ok())
+        .filter(|(_, url)| Url::parse(url).is_ok_and(|u| skip.skips_folder(&u)))
+        .map(|(id, _)| id)
+        .collect();
+    for id in &skipped {
+        delete_dir_entries(conn, *id)?;
+        conn.execute("DELETE FROM dirs WHERE id = ?1", [id])?;
+    }
+    Ok((hosts, skipped.len()))
+}
+
+fn drop_listed_hosts(
+    conn: &Connection,
+    list: &[String],
+    status: HostStatus,
+    reason: &str,
+) -> Result<Vec<String>> {
+    if list.is_empty() {
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
-        "SELECT host FROM hosts WHERE status != 'opted_out'
-         UNION SELECT host FROM candidates",
+        "SELECT host FROM hosts WHERE status != ?1
+         UNION SELECT host FROM candidates
+         UNION SELECT host FROM dirs",
     )?;
     let hosts: Vec<String> = stmt
-        .query_map([], |row| row.get(0))?
+        .query_map([status.as_str()], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let dropped: Vec<String> = hosts
         .into_iter()
-        .filter(|h| filters::host_opted_out(h, optout))
+        .filter(|h| filters::host_opted_out(h, list))
         .collect();
     for host in &dropped {
         let msg = Msg::HostDone {
             host: host.clone(),
-            status: HostStatus::OptedOut,
+            status,
             server: None,
             dirs: 0,
-            reason: Some("on the opt-out list".into()),
+            reason: Some(reason.into()),
             purge: true,
         };
         apply(conn, &msg)?;
@@ -450,8 +565,12 @@ pub fn apply_optout(conn: &Connection, optout: &[String]) -> Result<Vec<String>>
 /// Removes everything known about a host (crawl result, entries, candidates),
 /// so it can be crawled or re-checked from scratch. Returns false if unknown.
 pub fn forget(conn: &Connection, host: &str) -> Result<bool> {
-    let mut known = conn.execute("DELETE FROM hosts WHERE host = ?1", [host])? > 0;
-    known |= conn.execute("DELETE FROM entries WHERE host = ?1", [host])? > 0;
+    let had_dirs = conn.query_row("SELECT count(*) FROM dirs WHERE host = ?1", [host], |row| {
+        row.get::<_, i64>(0)
+    })? > 0;
+    purge_host(conn, host)?;
+    let mut known = had_dirs;
+    known |= conn.execute("DELETE FROM hosts WHERE host = ?1", [host])? > 0;
     known |= conn.execute("DELETE FROM candidates WHERE host = ?1", [host])? > 0;
     Ok(known)
 }
@@ -521,15 +640,22 @@ pub fn search(conn: &Connection, query: &str, opts: SearchOptions) -> Result<Vec
     )?;
 
     let mut stmt = conn.prepare(
-        "SELECT e.url, e.name, e.is_dir, e.size, e.mtime
-         FROM entries_fts
-         JOIN entries e ON e.rowid = entries_fts.rowid
-         WHERE entries_fts MATCH ?1
-           AND (?2 IS NULL OR (e.is_dir = 0 AND substr(lower(e.name), -length(?2) - 1) = '.' || ?2))
-           AND NOT hidden(e.url, e.name, e.host)
-           AND NOT EXISTS (SELECT 1 FROM hosts h
-                           WHERE h.host = e.host AND h.status IN ('opted_out', 'sensitive'))
-         ORDER BY bm25(entries_fts, 10.0, 1.0)
+        "SELECT r.url, r.name, r.is_dir, r.size, r.mtime FROM (
+             SELECT d.url || coalesce(e.href, e.name)
+                        || CASE WHEN e.is_dir THEN '/' ELSE '' END AS url,
+                    e.name AS name, e.is_dir AS is_dir, e.size AS size, e.mtime AS mtime,
+                    d.host AS host, bm25(entries_fts, 10.0, 1.0) AS rank
+             FROM entries_fts
+             JOIN entries e ON e.id = entries_fts.rowid
+             JOIN dirs d ON d.id = e.dir_id
+             WHERE entries_fts MATCH ?1
+               AND (?2 IS NULL
+                    OR (e.is_dir = 0 AND substr(lower(e.name), -length(?2) - 1) = '.' || ?2))
+         ) r
+         WHERE NOT hidden(r.url, r.name, r.host)
+           AND NOT EXISTS (SELECT 1 FROM hosts h WHERE h.host = r.host
+                           AND h.status IN ('opted_out', 'sensitive', 'skipped'))
+         ORDER BY r.rank
          LIMIT ?3",
     )?;
     let ext = ext.map(|e| e.trim_start_matches('.').to_lowercase());
@@ -639,22 +765,134 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_a_v1_database() {
-        let path = temp_path("v1");
+    fn refuses_databases_with_the_old_layout() {
+        let path = temp_path("old-layout");
         Connection::open(&path)
             .unwrap()
-            .execute_batch(
-                "CREATE TABLE hosts (host TEXT PRIMARY KEY, status TEXT NOT NULL, server TEXT,
-                 dirs INTEGER NOT NULL DEFAULT 0, files INTEGER NOT NULL DEFAULT 0,
-                 bytes INTEGER NOT NULL DEFAULT 0, crawled_at INTEGER NOT NULL);
-                 INSERT INTO hosts VALUES ('old.example', 'sensitive', NULL, 1, 0, 0, 0);",
-            )
+            .execute_batch("CREATE TABLE entries (url TEXT PRIMARY KEY, name TEXT);")
             .unwrap();
+        let error = open(&path).unwrap_err().to_string();
+        assert!(error.contains("older version"), "{error}");
+    }
+
+    fn entry(url: &str, is_dir: bool, size: Option<u64>) -> Entry {
+        let url = Url::parse(url).unwrap();
+        let name = url
+            .path_segments()
+            .and_then(|mut s| s.rfind(|p| !p.is_empty()))
+            .map(|p| percent_decode_str(p).decode_utf8_lossy().into_owned())
+            .unwrap();
+        Entry {
+            url,
+            name,
+            is_dir,
+            size,
+            mtime: Some("2026-09-28 10:15".into()),
+        }
+    }
+
+    fn files(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("SELECT url FROM files ORDER BY url").unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn hits(conn: &Connection, query: &str) -> usize {
+        let opts = SearchOptions {
+            limit: 100,
+            ext: None,
+            unfiltered: true,
+            takedown: vec![],
+            optout: vec![],
+        };
+        search(conn, query, opts).unwrap().len()
+    }
+
+    #[test]
+    fn listings_are_stored_compactly_and_urls_come_back_exactly() {
+        let conn = open(&temp_path("compact")).unwrap();
+        let urls = [
+            "https://h.example/pub/My%20Notes%20%26%20Ideas.txt",
+            "https://h.example/pub/linux-6.16.tar.xz",
+            "https://h.example/pub/%D0%9A%D0%BD%D0%B8%D0%B3%D0%B8/",
+        ];
+        let entries = vec![
+            entry(urls[0], false, Some(512)),
+            entry(urls[1], false, Some(149_213_136)),
+            entry(urls[2], true, None),
+        ];
+        let msg = Msg::Entries {
+            host: "h.example".into(),
+            entries,
+        };
+        apply(&conn, &msg).unwrap();
+
+        let mut expected: Vec<String> = urls.iter().map(|u| u.to_string()).collect();
+        expected.sort();
+        assert_eq!(files(&conn), expected);
+        // Names are stored decoded; the link text only when it differs.
+        let hrefs: i64 = conn
+            .query_row("SELECT count(href) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hrefs, 2);
+        assert_eq!(hits(&conn, "notes ideas"), 1);
+        assert_eq!(hits(&conn, "Книги"), 1);
+        assert_eq!(hits(&conn, "pub linux"), 1, "folder path is searchable too");
+
+        // Reading the listing again replaces it: the removed file is gone.
+        let msg = Msg::Entries {
+            host: "h.example".into(),
+            entries: vec![entry(urls[1], false, Some(149_213_137))],
+        };
+        apply(&conn, &msg).unwrap();
+        assert_eq!(files(&conn), vec![urls[1].to_string()]);
+        assert_eq!(hits(&conn, "notes"), 0);
+
+        // Dropping the host removes its listings and search entries.
+        let done = Msg::HostDone {
+            host: "h.example".into(),
+            status: HostStatus::Sensitive,
+            server: None,
+            dirs: 1,
+            reason: None,
+            purge: true,
+        };
+        apply(&conn, &done).unwrap();
+        assert!(files(&conn).is_empty());
+        assert_eq!(hits(&conn, "linux"), 0);
+    }
+
+    #[test]
+    fn about_130_bytes_per_file() {
+        let path = temp_path("size");
         let conn = open(&path).unwrap();
-        assert_eq!(
-            sensitive_reasons(&conn).unwrap(),
-            vec![("old.example".to_string(), "(not recorded)".to_string())]
-        );
+        for d in 0..50 {
+            let entries = (0..200)
+                .map(|f| {
+                    let url = format!(
+                        "https://mirror.example.org/pub/project-{d}/release-{f}.0.1-x86_64.tar.gz"
+                    );
+                    entry(&url, false, Some(1_000_000 + f))
+                })
+                .collect();
+            let msg = Msg::Entries {
+                host: "mirror.example.org".into(),
+                entries,
+            };
+            apply(&conn, &msg).unwrap();
+        }
+        conn.execute_batch("VACUUM").unwrap();
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap();
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap();
+        let per_file = pages * page_size / 10_000;
+        eprintln!("{per_file} bytes per file");
+        assert!(per_file < 180, "{per_file} bytes per file");
     }
 
     #[test]

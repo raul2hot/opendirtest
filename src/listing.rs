@@ -450,6 +450,11 @@ static DATE_PATTERNS: LazyLock<Vec<(DateOrder, Regex)>> = LazyLock::new(|| {
             DateOrder::DMonY,
             format!(r"(\d{{1,2}})-([A-Za-z]{{3}})-(\d{{4}}) {time}"),
         ),
+        // Node.js's release server: 22 Sept 2026, 09:01
+        (
+            DateOrder::DMonY,
+            format!(r"(\d{{1,2}})\s+([A-Za-z]{{3,9}})\.?\s+(\d{{4}}),?\s+{time}{ampm}"),
+        ),
         // lighttpd, fancyindex: 2026-Sep-28 10:15:00
         (
             DateOrder::YMonD,
@@ -853,6 +858,44 @@ mod tests {
     }
 
     #[test]
+    fn day_month_year_dates_with_a_comma_and_sizes_with_units() {
+        // Node.js's release server: `22 Sept 2026, 09:01`, `87 MB`, absolute links,
+        // and a dash where folders have no date or size.
+        let listing = parse_fixture(
+            "https://nodejs.org/dist/latest/",
+            Some("text/html"),
+            include_str!("../tests/fixtures/nodejs_dist.html"),
+        );
+        let at = |t: &'static str| Some(t);
+        assert_eq!(
+            rows(&listing),
+            vec![
+                ("docs", true, None, None),
+                ("win-x64", true, None, None),
+                ("SHASUMS256.txt", false, Some(3277), at("2026-09-22 09:01")),
+                (
+                    "SHASUMS256.txt.sig",
+                    false,
+                    Some(119),
+                    at("2026-09-22 09:02")
+                ),
+                (
+                    "node-v26.10.0-aix-ppc64.tar.gz",
+                    false,
+                    Some(87 * 1024 * 1024),
+                    at("2026-09-22 09:01")
+                ),
+                (
+                    "node-v26.10.0-headers.tar.xz",
+                    false,
+                    Some(584 * 1024),
+                    at("2026-09-22 09:01")
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn caddy_json() {
         let listing = parse_fixture(
             "https://files.example.com/pub/",
@@ -991,6 +1034,9 @@ mod tests {
             Some("2026-09-28 22:15".into())
         );
         assert_eq!(d("28.09.2026 10:15"), Some("2026-09-28 10:15".into()));
+        assert_eq!(d("22 Sept 2026, 09:01"), Some("2026-09-22 09:01".into()));
+        assert_eq!(d("5 January 2026 9:05 PM"), Some("2026-01-05 21:05".into()));
+        assert_eq!(d("5 Dogs 2026, 09:01"), None);
         assert_eq!(d("2026-13-01 10:00"), None);
         assert_eq!(d("no date here"), None);
     }

@@ -57,6 +57,8 @@ pub struct Listing {
     /// directory (navigation, "see also" links). Only followed when
     /// `FOLLOW_LISTED_LINKS_ONLY` is off.
     pub other_dirs: Vec<Url>,
+    /// Directory links to other sites, kept as discovery candidates.
+    pub external_dirs: Vec<Url>,
 }
 
 /// Parses `body` fetched from `base`. Returns `None` if it is not a directory listing.
@@ -99,7 +101,6 @@ fn name_from_url(url: &Url) -> String {
 
 #[derive(Deserialize)]
 struct CaddyItem {
-    name: String,
     size: u64,
     url: String,
     mod_time: String,
@@ -121,11 +122,14 @@ fn parse_caddy_json(base: &Url, body: &str) -> Option<Listing> {
             let mtime = RFC3339
                 .captures(&item.mod_time)
                 .map(|c| format!("{} {}", &c[1], &c[2]));
+            // Caddy appends `/` to directory names, so take the name from the URL.
             Some(Entry {
+                name: name_from_url(&url),
                 url,
-                name: item.name,
                 is_dir: item.is_dir,
-                size: (!item.is_dir).then_some(item.size),
+                size: (!item.is_dir)
+                    .then_some(item.size)
+                    .filter(|&s| s <= MAX_SIZE),
                 mtime,
             })
         })
@@ -134,6 +138,7 @@ fn parse_caddy_json(base: &Url, body: &str) -> Option<Listing> {
         server: Server::Caddy,
         entries,
         other_dirs: Vec::new(),
+        external_dirs: Vec::new(),
     })
 }
 
@@ -141,17 +146,29 @@ fn parse_caddy_json(base: &Url, body: &str) -> Option<Listing> {
 // HTML listings
 // ---------------------------------------------------------------------------
 
+// `href` must follow whitespace, so `data-href` is not mistaken for it.
 static ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?is)<a\s[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>.*?</a\s*>"#)
-        .unwrap()
+    Regex::new(
+        r#"(?is)<a\s(?:[^>]*?\s)?href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>.*?</a\s*>"#,
+    )
+    .unwrap()
 });
+static COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").unwrap());
 static LISTING_HEADING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)<(?:title|h1|h2)[^>]*>\s*(?:index of\b|directory listing for\b)").unwrap()
 });
 static TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]*>").unwrap());
+/// An IIS row: date, time and `<dir>` or a size, then the link. Needed because
+/// IIS omits "[To Parent Directory]" at the site root.
+static IIS_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"<br>\s*\d{1,2}[./]\d{1,2}[./]\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:[ap]m)?\s+(?:&lt;dir&gt;|\d+)\s+<a\s",
+    )
+    .unwrap()
+});
 
 fn detect(lower: &str) -> Option<Server> {
-    let is_iis = lower.contains("[to parent directory]");
+    let is_iis = lower.contains("[to parent directory]") || IIS_ROW.is_match(lower);
     if !is_iis && !LISTING_HEADING.is_match(lower) {
         return None;
     }
@@ -172,6 +189,7 @@ fn detect(lower: &str) -> Option<Server> {
 }
 
 fn parse_html(base: &Url, body: &str) -> Option<Listing> {
+    let body = &*COMMENT.replace_all(body, "");
     let server = detect(&body.to_ascii_lowercase())?;
 
     // (start, end, href) of every link on the page.
@@ -191,6 +209,7 @@ fn parse_html(base: &Url, body: &str) -> Option<Listing> {
     let mut entries: Vec<Entry> = Vec::new();
     let mut by_url: HashMap<String, usize> = HashMap::new();
     let mut other_dirs = Vec::new();
+    let mut external_dirs = Vec::new();
 
     for (i, &(start, end, href)) in anchors.iter().enumerate() {
         let Ok(mut url) = base.join(&decode_entities(href)) else {
@@ -199,6 +218,12 @@ fn parse_html(base: &Url, body: &str) -> Option<Listing> {
         url.set_fragment(None);
         if !matches!(url.scheme(), "http" | "https") || url.query().is_some() {
             continue; // sort links like ?C=N;O=D
+        }
+        if url.host_str() != base.host_str() {
+            if url.path().ends_with('/') {
+                external_dirs.push(url);
+            }
+            continue;
         }
         if !is_child(base, &url) {
             let is_ancestor = base.path().starts_with(url.path());
@@ -245,6 +270,7 @@ fn parse_html(base: &Url, body: &str) -> Option<Listing> {
         server,
         entries,
         other_dirs,
+        external_dirs,
     })
 }
 
@@ -306,7 +332,7 @@ fn decode_entity(name: &str) -> Option<char> {
             } else {
                 name.strip_prefix('#')?.parse().ok()?
             };
-            char::from_u32(code)
+            char::from_u32(code).filter(|c| !c.is_control())
         }
     }
 }
@@ -352,6 +378,11 @@ static DATE_PATTERNS: LazyLock<Vec<(DateOrder, Regex)>> = LazyLock::new(|| {
             DateOrder::Mdy,
             format!(r"(\d{{1,2}})/(\d{{1,2}})/(\d{{4}})\s+{time}{ampm}"),
         ),
+        // IIS in many non-US locales: 28.09.2026 10:15
+        (
+            DateOrder::DmyDots,
+            format!(r"(\d{{1,2}})\.(\d{{1,2}})\.(\d{{4}})\s+{time}"),
+        ),
         // IIS long form: Monday, September 28, 2026 10:15 AM
         (
             DateOrder::MonDY,
@@ -372,6 +403,7 @@ enum DateOrder {
     YMonD,
     Mdy,
     MonDY,
+    DmyDots,
 }
 
 /// Returns the normalised date and the byte range it covered in `text`.
@@ -395,6 +427,7 @@ fn normalise_date(order: DateOrder, c: &regex::Captures<'_>) -> Option<String> {
         DateOrder::YMonD => (num(1)?, month_number(&c[2])?, num(3)?),
         DateOrder::Mdy => (num(3)?, num(1)?, num(2)?),
         DateOrder::MonDY => (num(3)?, month_number(&c[1])?, num(2)?),
+        DateOrder::DmyDots => (num(3)?, num(2)?, num(1)?),
     };
     let mut hour = num(4)?;
     let minute = num(5)?;
@@ -429,6 +462,9 @@ fn month_number(name: &str) -> Option<u32> {
         .map(|i| i as u32 + 1)
 }
 
+/// Largest size we believe (2^53 bytes, 8 PiB).
+const MAX_SIZE: u64 = 1 << 53;
+
 const SIZE_TOKEN: &str = r"(?:-|<dir>|(\d+(?:\.\d+)?)\s*([KMGTP])?(?:i?B(?:ytes)?)?)";
 
 /// Size at the start of `text`. `Some(None)` means an explicit "no size" (`-`, `<dir>`).
@@ -454,7 +490,9 @@ fn size_from(c: regex::Captures<'_>) -> Option<Option<u64>> {
         None => 0,
         Some(unit) => "KMGTP".find(&unit)? as i32 + 1,
     };
-    Some(Some((value * 1024f64.powi(power)).round() as u64))
+    let bytes = (value * 1024f64.powi(power)).round();
+    // Anything above 8 PiB is not a real file size; don't let it overflow sums.
+    Some((bytes <= MAX_SIZE as f64).then_some(bytes as u64))
 }
 
 #[cfg(test)]
@@ -627,6 +665,48 @@ mod tests {
     }
 
     #[test]
+    fn iis_site_root_without_parent_link() {
+        let listing = parse_fixture(
+            "https://files.example.edu/",
+            None,
+            include_str!("../tests/fixtures/iis_root.html"),
+        );
+        assert_eq!(listing.server, Server::Iis);
+        assert_eq!(
+            rows(&listing),
+            vec![
+                ("pub", true, None, Some("2026-09-28 10:15")),
+                ("readme.txt", false, Some(123_456), Some("2026-01-05 15:07")),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_data_href_and_commented_out_links() {
+        let base = Url::parse("https://h.example/pub/").unwrap();
+        let body = r#"<title>Index of /pub/</title><pre>
+            <a data-href="evil/" href="good.txt">good.txt</a> 2026-09-28 10:15 1K
+            <!-- <a href="hidden/">hidden/</a> -->
+            </pre>"#;
+        let listing = parse(&base, None, body).unwrap();
+        let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["good.txt"]);
+    }
+
+    #[test]
+    fn collects_directory_links_to_other_sites() {
+        let base = Url::parse("https://h.example/pub/").unwrap();
+        let body = r#"<title>Index of /pub/</title>
+            <a href="https://mirror.example.net/pub/">mirror</a>
+            <a href="https://mirror.example.net/about.html">about</a>
+            <a href="https://other.example/list/?C=N;O=D">sorted</a>
+            <a href="f.txt">f.txt</a>"#;
+        let listing = parse(&base, None, body).unwrap();
+        let external: Vec<_> = listing.external_dirs.iter().map(Url::as_str).collect();
+        assert_eq!(external, vec!["https://mirror.example.net/pub/"]);
+    }
+
+    #[test]
     fn caddy_json() {
         let listing = parse_fixture(
             "https://files.example.com/pub/",
@@ -711,6 +791,8 @@ mod tests {
         assert_eq!(size_prefix("GNU Hello"), None);
         assert_eq!(size_exact("12.3 KiB"), Some(Some(12_595)));
         assert_eq!(size_exact("3 B"), Some(Some(3)));
+        // Absurd sizes (a hostile listing) are dropped instead of overflowing totals.
+        assert_eq!(size_prefix("5000P"), Some(None));
     }
 
     #[test]
@@ -728,6 +810,7 @@ mod tests {
             d("Monday, September 28, 2026 10:15 PM"),
             Some("2026-09-28 22:15".into())
         );
+        assert_eq!(d("28.09.2026 10:15"), Some("2026-09-28 10:15".into()));
         assert_eq!(d("2026-13-01 10:00"), None);
         assert_eq!(d("no date here"), None);
     }
@@ -743,5 +826,6 @@ mod tests {
             "fish & chips &bogus;"
         );
         assert_eq!(decode_entities("é&amp;"), "é&");
+        assert_eq!(decode_entities("a&#0;b"), "a&#0;b");
     }
 }

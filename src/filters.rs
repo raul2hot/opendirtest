@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::RegexSet;
+use url::Url;
 
 /// File or directory names that almost always mean a listing was exposed by
 /// accident. Deliberately narrow: public keys, `.pem` bundles and dataset SQL
@@ -42,8 +43,9 @@ static LIKELY_INFRINGING: LazyLock<RegexSet> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// `name` may carry a trailing `/` for directories (Caddy does this).
 pub fn is_sensitive_name(name: &str) -> bool {
-    SENSITIVE_NAMES.is_match(name)
+    SENSITIVE_NAMES.is_match(name.trim_end_matches('/'))
 }
 
 /// `path` is a URL path, still percent-encoded.
@@ -56,19 +58,50 @@ pub fn is_likely_infringing(name: &str) -> bool {
 }
 
 /// Reads a list file: one item per line, `#` starts a comment. A missing file
-/// is an empty list.
+/// is an empty list. Handles the UTF-8 BOM and UTF-16 that Windows tools write.
 pub fn load_list(path: &Path) -> anyhow::Result<Vec<String>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", path.display())),
     };
-    Ok(text
+    Ok(decode_text(&bytes)
         .lines()
         .map(|line| line.split('#').next().unwrap_or("").trim())
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect())
+}
+
+fn decode_text(bytes: &[u8]) -> String {
+    fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
+        let units: Vec<u16> = bytes.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&units)
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(rest).into_owned()
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        utf16(rest, u16::from_le_bytes)
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        utf16(rest, u16::from_be_bytes)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+/// Lower-cases a domain and converts international names to the ASCII form
+/// that URLs use, so opt-out entries match crawled hosts.
+pub fn normalize_domain(domain: &str) -> String {
+    Url::parse(&format!("http://{domain}/"))
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| domain.to_ascii_lowercase())
+}
+
+/// Normalises a takedown URL prefix the same way crawled URLs are stored
+/// (lower-case host, no default port, percent-encoded path).
+pub fn normalize_url_prefix(prefix: &str) -> String {
+    Url::parse(prefix).map_or_else(|_| prefix.to_string(), String::from)
 }
 
 /// Opt-out list entries are domains; a domain also covers its subdomains.
@@ -141,6 +174,41 @@ mod tests {
         assert!(!is_likely_infringing("foo_1.0+repack.orig.tar.gz"));
         assert!(!is_likely_infringing("ssh-keygen.1.html"));
         assert!(!is_likely_infringing("lecture-01.mp4"));
+    }
+
+    #[test]
+    fn caddy_style_directory_names() {
+        assert!(is_sensitive_name(".git/"));
+        assert!(is_sensitive_name(".aws/"));
+    }
+
+    #[test]
+    fn list_files_from_windows_tools() {
+        let dir = std::env::temp_dir().join(format!("opendirtest-lists-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bom = dir.join("bom.txt");
+        std::fs::write(&bom, b"\xEF\xBB\xBFexample.org\r\nother.net # note\r\n").unwrap();
+        assert_eq!(load_list(&bom).unwrap(), vec!["example.org", "other.net"]);
+
+        let utf16 = dir.join("utf16.txt");
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "example.org\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&utf16, bytes).unwrap();
+        assert_eq!(load_list(&utf16).unwrap(), vec!["example.org"]);
+
+        assert!(load_list(&dir.join("missing.txt")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn normalisation() {
+        assert_eq!(normalize_domain("Example.ORG"), "example.org");
+        assert_eq!(normalize_domain("bücher.example"), "xn--bcher-kva.example");
+        assert_eq!(
+            normalize_url_prefix("HTTPS://H.Example:443/pub/my file"),
+            "https://h.example/pub/my%20file"
+        );
     }
 
     #[test]

@@ -2,6 +2,8 @@
 # One directory URL per line. The crawler still checks robots.txt for each host
 # and skips anything that is not a directory listing, so a stale entry is harmless.
 https://archive.ubuntu.com/ubuntu/
+https://releases.ubuntu.com/
+https://cdimage.debian.org/debian-cd/
 https://deb.debian.org/debian/
 https://dl.fedoraproject.org/pub/
 https://mirrors.kernel.org/

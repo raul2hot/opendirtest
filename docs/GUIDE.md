@@ -498,14 +498,18 @@ Gbit/s.
 
 ## 9. Build roadmap
 
-**v1 status (in this repo):** steps 1–3, 5 and 6 are built, with a few simplifications:
+**Status (in this repo):** steps 1–3, 5 and 6 are built, and discovery (steps 4 and
+7) has started, with a few simplifications:
 
 - The scheduler is one task per host plus a concurrency cap, instead of a ready-time heap.
 - Metrics are a progress line, not Prometheus.
 - Storage and search are a single SQLite file with FTS5, instead of Parquet, DuckDB and
   Meilisearch.
+- Discovery covers the Common Crawl sort-link query (§3.1, as `opendir discover`, reading
+  the Parquet index with HTTP range requests instead of DuckDB) and link expansion
+  (§3.6, including cross-site redirects). Censys/Shodan and CT logs are not built.
 - There are no trust tiers yet (§6.1). Every verified host is handled like tier 1.
-- The `ls-lR` shortcut and discovery (steps 4 and 7) are next.
+- The `ls-lR` shortcut and mtime-guided recrawl are next.
 
 1. **Parser first:** fixtures and golden tests for the 8 server types in §5.3.
 2. **Single-host walker:** robots, politeness, trap guards, the `ls-lR` shortcut, Caddy

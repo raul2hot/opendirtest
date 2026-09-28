@@ -2,7 +2,7 @@
 name = "opendirtest"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 publish = false
 description = "Fast, polite indexer for public open directories"
 
@@ -12,7 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+arrow-array = "60"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+futures = "0.3"
+parquet = { version = "60", default-features = false, features = ["arrow", "async", "zstd", "flate2-rust_backend"] }
 percent-encoding = "2"
 regex = "1"
 reqwest = { version = "0.13", features = ["gzip", "brotli", "zstd"] }
@@ -21,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 texting_robots = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tokio-util = "0.7"
 url = "2"
 
 [dev-dependencies]

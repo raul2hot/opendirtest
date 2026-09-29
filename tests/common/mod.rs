@@ -93,20 +93,39 @@ impl Server {
 }
 
 pub async fn serve(routes: HashMap<String, Route>) -> Server {
+    serve_with(Arc::new(move |path, _| {
+        routes
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| Route::text(404, "not found"))
+    }))
+    .await
+}
+
+/// Answers every request from `handler(path, n)`, `n` being the number of the
+/// request (from 1, robots.txt included), for sites made up as they are asked for.
+pub type Handler = Arc<dyn Fn(&str, u64) -> Route + Send + Sync>;
+
+pub async fn serve_with(handler: Handler) -> Server {
     // All of 127.0.0.0/8 is loopback, so one server can play several "sites".
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let base = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
     let log = Arc::new(Mutex::new(Vec::new()));
     let sent = Arc::new(Mutex::new(HashMap::new()));
-    let routes = Arc::new(routes);
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (log2, sent2) = (log.clone(), sent.clone());
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
-            let (routes, log, sent) = (routes.clone(), log2.clone(), sent2.clone());
+            let (handler, log, sent, counter) = (
+                handler.clone(),
+                log2.clone(),
+                sent2.clone(),
+                counter.clone(),
+            );
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -125,10 +144,8 @@ pub async fn serve(routes: HashMap<String, Route>) -> Server {
                         .then(|| value.trim().to_string())
                 });
 
-                let route = routes
-                    .get(&path)
-                    .cloned()
-                    .unwrap_or_else(|| Route::text(404, "not found"));
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let route = handler(&path, n);
                 let (status, extra, body) = match (&range, route.status) {
                     (Some(range), 200) => partial(range, &route.body),
                     _ => (route.status, None, route.body.clone()),

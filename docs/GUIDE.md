@@ -352,7 +352,8 @@ the crawler.
 - Timeouts: connect 5 s, first byte 10 s, total 30 s. Follow redirects **only on the same
   site**, at most 3.
 - Cap the body at 2–8 MB. Mark a listing that hits the cap as truncated and flag the host
-  for an `ls-lR` check.
+  for an `ls-lR` check. (Built: `CrawlConfig::max_listing_bytes`, 32 MiB, since a folder of
+  50,000 files is about 10 MB; the host's reason says that a listing was cut short.)
 - Record status code, server header, latency, bytes and the fingerprint result for every
   request. Export them with OpenTelemetry or Prometheus.
 
@@ -515,14 +516,25 @@ Gbit/s.
   and saves its frontier as candidates, and `opendir auto` chains nightly runs.
 - Trust has two levels instead of the tiers in §6.1: sites you added (seeds) are
   trusted; everything else is untrusted and is dropped if it holds too little of value
-  (`src/quality.rs`: 3 big files or 20 useful files, judged when the site is finished;
-  an unfinished site is dropped early only when plainly junk, counting only leaf folders
-  (`dirs.leaf`, set by the crawler) from at least 20 places, and only when that sample is
-  fair (`quality::sample`: leaves as deep as, and at least as many as, the folders still
-  waiting), since an archive's top folders hold README files and its downloads are further
-  down; 2,000 leaf files with nothing big or useful are junk whatever waits, which bounds
-  the cost of a huge junk site; a site that gave up or vanished is judged over all its
-  files; a paused site that cannot be reached stays paused). Trust passes to the new
+  (`src/quality.rs`: 3 big files or 20 useful files, judged when the site is finished
+  (`Thresholds::judge_final`). One still being crawled is judged by `judge_crawling` on a
+  `Progress` that the crawler keeps in memory and the store recomputes from the database
+  (`store::progress_of`, `waiting_of`), so both reach the same verdict, and a continued
+  run starts from what earlier runs read. Value counts anywhere: one big file keeps the
+  site, and so do 20 useful ones, in any folder. Junk is called only on the leaf folders
+  (`dirs.leaf`, set by the crawler) at the deepest level read, since an archive's
+  downloads sit at the bottom of its tree, and only for a fair sample (`Progress::is_fair`:
+  at least 20 such folders, none waiting deeper, no more waiting at that level than were
+  read) with at least 100 files and under 5% useful; or after `HARD_FOLDERS` (2,000)
+  folders with under 1% useful, which bounds crawler traps. The frontier is read
+  breadth first (`waiting_urls` orders by path depth). A site that gave up or vanished
+  (`judge_ended`) is dropped only when plainly junk.) Failures are strikes, not endings:
+  a run that stops on 5 errors or 50 refusals in a row, or ends with folders that could
+  not be read, leaves the site paused with those folders on its frontier and adds a strike
+  (`hosts.fails`); a run without errors clears them, and 5 in a row end the site
+  (`partial`, or `unreachable` with nothing read). The budget counts folders asked for. A
+  candidate whose folders are all on the skip list starts from the site's front page.
+  Trust passes to the new
   address of a moved seed for one step only (`candidates.source = 'moved'`), and a
   redirect never clears a `sensitive` verdict. Sensitive names are strong (drop the site) or
   weak (drop an untrusted site, or just the entry on a trusted one), and include the

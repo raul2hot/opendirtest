@@ -3,7 +3,7 @@
 //! lives in that task, so hosts never need to coordinate.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use url::Url;
 
 use crate::filters::{self, Sensitivity};
 use crate::listing::{self, Entry, Listing};
-use crate::quality::{self, Counts, Thresholds};
+use crate::quality::{self, Progress, Thresholds, Waiting};
 use crate::safety::{
     DROP_SENSITIVE_EXPOSURES, ENFORCE_PER_HOST_RATE_LIMIT, FOLLOW_LISTED_LINKS_ONLY,
     HONOR_OPT_OUT_LIST, RESPECT_ROBOTS_TXT, SEND_IDENTIFYING_USER_AGENT,
@@ -39,7 +39,9 @@ pub const USER_AGENT: &str = concat!(
 /// `candidates.source` for directory links found on other sites' listings.
 pub const LINK_SOURCE: &str = "link";
 
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// The default for `CrawlConfig::max_listing_bytes`. A folder of 50,000 files is
+/// about 11 MB as an Apache table.
+pub const MAX_LISTING_BYTES: usize = 32 * 1024 * 1024;
 /// RFC 9309 asks crawlers to parse at least 500 KiB.
 const MAX_ROBOTS_BYTES: usize = 500 * 1024;
 const MAX_URL_LEN: usize = 2048;
@@ -47,6 +49,9 @@ const MAX_URL_LEN: usize = 2048;
 const MAX_REDIRECTS: usize = 5;
 const MAX_RETRIES: u32 = 3;
 const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+/// This many folders in a row refused with 403, 404 and the like end the run: the
+/// server is blocking us, or the listing is full of dead links.
+const MAX_REFUSED_IN_A_ROW: usize = 50;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// Hosts asking for a longer Crawl-delay than this are skipped rather than
 /// holding a crawl slot for days.
@@ -83,6 +88,9 @@ pub struct CrawlConfig {
     /// Record links to any directory, not only ones that look like a public
     /// archive (`filters::has_archive_signal`).
     pub broad: bool,
+    /// A listing page is read up to this many bytes; a longer one is cut short (and
+    /// the site's reason says so).
+    pub max_listing_bytes: usize,
 }
 
 impl Default for CrawlConfig {
@@ -98,6 +106,7 @@ impl Default for CrawlConfig {
             allow_private_links: false,
             quality: Thresholds::default(),
             broad: false,
+            max_listing_bytes: MAX_LISTING_BYTES,
         }
     }
 }
@@ -185,6 +194,7 @@ pub async fn crawl(
                     trusted: site.trusted,
                     first_run: !site.known,
                     seed_urls: site.seeds.iter().map(Url::to_string).collect(),
+                    progress: site.progress,
                     client: client.clone(),
                     pacer: Pacer::new(cfg.per_host_delay),
                     cfg: cfg.clone(),
@@ -307,12 +317,16 @@ struct Page {
     url: Url,
     content_type: Option<String>,
     body: String,
+    /// The listing was longer than `MAX_BODY_BYTES` and was cut short.
+    truncated: bool,
 }
 
 enum Fetch {
     Page(Page),
-    /// Nothing usable here (404, a file, robots.txt says no, ...).
+    /// Nothing usable here (a file, robots.txt says no, ...).
     Skipped,
+    /// The server refused the folder (403, 404, ...), with the status line.
+    Refused(String),
     Failed(String),
     Stopped,
 }
@@ -338,6 +352,8 @@ struct HostCrawl {
     /// The URLs you added yourself, as text. Only a crawl started from one of these
     /// passes trust on when it turns out to have moved.
     seed_urls: HashSet<String>,
+    /// What was read of the site in earlier runs, for one that continues.
+    progress: Option<Progress>,
     client: Client,
     cfg: Arc<CrawlConfig>,
     tx: mpsc::Sender<Msg>,
@@ -361,6 +377,8 @@ struct Report {
     reason: Option<String>,
     /// Delete what was stored for the host.
     purge: bool,
+    /// The run ended because of errors or refusals, not because the crawl is over.
+    failed: bool,
 }
 
 impl HostCrawl {
@@ -376,6 +394,7 @@ impl HostCrawl {
                 purge: report.purge,
                 trusted: self.trusted,
                 judge: (!self.trusted && self.cfg.quality.enabled()).then_some(self.cfg.quality),
+                failed: report.failed,
             };
             let _ = self.tx.send(msg).await;
         }
@@ -393,6 +412,7 @@ impl HostCrawl {
                 dirs: 0,
                 reason: Some("on the opt-out list".into()),
                 purge: true,
+                failed: false,
             });
         }
         if DROP_SENSITIVE_EXPOSURES && self.cfg.sensitive_hosts.contains(&self.host) {
@@ -405,56 +425,111 @@ impl HostCrawl {
                 dirs: 0,
                 reason: Some("on the skip list".into()),
                 purge: true,
+                failed: false,
             });
         }
 
         let started_from = seeds.clone();
-        let seeds: Vec<Url> = seeds
+        let mut seeds: Vec<Url> = seeds
             .into_iter()
             .filter(|u| !self.cfg.skip.skips_folder(u))
             .collect();
         if seeds.is_empty() {
-            return Some(Report {
-                status: HostStatus::Done,
-                server: None,
-                dirs: 0,
-                reason: Some("nothing to crawl outside skipped folders".into()),
-                purge: false,
-            });
+            // Every folder this site was found by is on the skip list (a link into a
+            // mirror's `/pool/`). A first run reads the site's front page instead, which
+            // may hold more than the folder it was found through; a site that continues
+            // has nothing left to read.
+            let front = started_from
+                .first()
+                .and_then(|u| u.join("/").ok())
+                .filter(|root| self.first_run && !self.cfg.skip.skips_folder(root));
+            match front {
+                Some(root) => seeds.push(filters::canonical_url(&root)),
+                None => {
+                    let (status, why) = if self.first_run {
+                        (
+                            HostStatus::Skipped,
+                            "every folder it was found by is on the skip list",
+                        )
+                    } else {
+                        (
+                            HostStatus::Done,
+                            "nothing left to read outside skipped folders",
+                        )
+                    };
+                    return Some(Report {
+                        status,
+                        server: None,
+                        dirs: 0,
+                        reason: Some(why.into()),
+                        purge: false,
+                        failed: false,
+                    });
+                }
+            }
         }
-        let mut queue: VecDeque<(Url, usize)> = seeds.into_iter().map(|u| (u, 0)).collect();
+        // The depth of a folder is how deep its address is, so that a site continued
+        // from a saved frontier is not given a fresh depth allowance every run.
+        let mut queue: VecDeque<(Url, usize)> = seeds
+            .into_iter()
+            .map(|u| {
+                let depth = filters::path_depth(u.as_str());
+                (u, depth)
+            })
+            .collect();
         let mut seen: HashSet<String> = queue.iter().map(|(u, _)| u.to_string()).collect();
         let mut listings = Listings::default();
         let mut server = None;
+        // Listings read this run, and folders asked for (the budget counts these, so
+        // that a site full of dead links costs no more than one full of listings).
         let mut dirs = 0u64;
+        let mut visited = 0u64;
         let mut stopped = false;
         let mut budget_reached = false;
         let mut overflow_saved = 0;
+        // How deep the folders saved past this run's budget are, for `judge_crawling`.
+        let mut overflow_depths: BTreeMap<usize, u64> = BTreeMap::new();
         let mut gave_up: Option<String> = None;
         let mut errors_in_a_row = 0;
-        // A new site you did not add is judged early, so junk does not hold a
-        // crawl slot: after PROBE_DIRS folders, by what its files look like.
-        let mut counts = Counts::default();
-        // The leaf folders counted so far, and how deep the deepest is.
-        let mut leaf_folders = 0u64;
-        let mut deepest_leaf: Option<usize> = None;
-        // How deep the deepest folder saved past this run's budget is.
-        let mut overflow_deepest: Option<usize> = None;
-        let early_judge = (!self.trusted && self.first_run && self.cfg.quality.enabled())
-            .then_some(self.cfg.quality);
+        // Folders refused (403, 404, ...) one after another, and folders that could
+        // not be read at all: both wait for the next run instead of being forgotten
+        // (refusals only when they end the run, since a dead link is nothing to retry).
+        let mut refused_in_a_row: Vec<Url> = Vec::new();
+        let mut failed: Vec<Url> = Vec::new();
+        let mut truncated = 0u32;
+        // A new site you did not add is judged early, so junk does not hold a crawl
+        // slot: from PROBE_DIRS folders on, by what its files look like. A site that
+        // continues brings what was read in earlier runs.
+        let mut progress = self.progress.take().unwrap_or_default();
+        let early_judge = (!self.trusted && self.cfg.quality.enabled()).then_some(self.cfg.quality);
 
         while let Some((url, depth)) = queue.pop_front() {
-            if self.stop.is_cancelled() || dirs >= self.cfg.max_dirs_per_host {
+            if self.stop.is_cancelled() || visited >= self.cfg.max_dirs_per_host {
                 stopped = self.stop.is_cancelled();
                 budget_reached = !stopped;
                 queue.push_front((url, depth));
                 break;
             }
+            visited += 1;
             let top = self.seed_urls.contains(url.as_str());
             let page = match self.fetch_page(url.clone(), top).await {
                 Fetch::Page(page) => page,
                 Fetch::Skipped => {
                     errors_in_a_row = 0;
+                    refused_in_a_row.clear();
+                    continue;
+                }
+                Fetch::Refused(why) => {
+                    errors_in_a_row = 0;
+                    refused_in_a_row.push(url);
+                    if refused_in_a_row.len() >= MAX_REFUSED_IN_A_ROW {
+                        gave_up = Some(format!(
+                            "the server refused {MAX_REFUSED_IN_A_ROW} folders in a row (last: {why})"
+                        ));
+                        self.last_error = Some(why);
+                        failed.append(&mut refused_in_a_row);
+                        break;
+                    }
                     continue;
                 }
                 Fetch::Stopped => {
@@ -465,6 +540,8 @@ impl HostCrawl {
                 Fetch::Failed(error) => {
                     self.stats.errors.fetch_add(1, Relaxed);
                     errors_in_a_row += 1;
+                    refused_in_a_row.clear();
+                    failed.push(url);
                     if errors_in_a_row >= MAX_CONSECUTIVE_ERRORS {
                         gave_up = Some(format!("too many errors, last: {error}"));
                         self.last_error = Some(error);
@@ -475,6 +552,8 @@ impl HostCrawl {
                 }
             };
             errors_in_a_row = 0;
+            refused_in_a_row.clear();
+            truncated += u32::from(page.truncated);
 
             // Parsing a big page takes a while; keep it off the async threads.
             let parsed = tokio::task::spawn_blocking(move || {
@@ -499,6 +578,7 @@ impl HostCrawl {
                     dirs,
                     reason: Some(why),
                     purge: true,
+                    failed: false,
                 });
             }
 
@@ -539,12 +619,13 @@ impl HostCrawl {
                 let mut overflow = Vec::new();
                 for dir in next {
                     if seen.insert(dir.to_string()) {
-                        if queue.len() as u64 + dirs < self.cfg.max_dirs_per_host {
+                        if queue.len() as u64 + visited < self.cfg.max_dirs_per_host {
                             queue.push_back((dir, depth + 1));
                         } else if overflow_saved < MAX_SAVED_OVERFLOW {
                             overflow_saved += 1;
-                            overflow_deepest =
-                                overflow_deepest.max(Some(filters::path_depth(dir.as_str())));
+                            *overflow_depths
+                                .entry(filters::path_depth(dir.as_str()))
+                                .or_default() += 1;
                             overflow.push(dir);
                         }
                     }
@@ -559,43 +640,37 @@ impl HostCrawl {
                 }
             }
 
-            // A new site you did not add is judged early, on what its leaf folders
-            // hold, and only as far as `quality::sample` trusts them against what
-            // still waits: the top of a big archive is README and index files, and
-            // its downloads are further down. Empty folders leave nothing stored,
-            // so they do not count.
-            if leaf && !entries.is_empty() {
+            // A new site you did not add is judged early, on what it holds so far
+            // (`Thresholds::judge_crawling`): any big or useful file anywhere is a sign
+            // of value, but junk is only called on the deepest layer of leaf folders
+            // read, since a tree's downloads are at its bottom and its top is README
+            // and index pages. Empty folders leave nothing stored, so they do not count.
+            if early_judge.is_some() {
+                progress.folders_read += 1;
+                let mut files = 0;
                 for e in entries.iter().filter(|e| !e.is_dir) {
-                    counts.add(&e.name, e.size);
+                    progress.note_file(&e.name, e.size);
+                    files += 1;
                 }
-                leaf_folders += 1;
-                deepest_leaf = deepest_leaf.max(Some(filters::path_depth(page_url.as_str())));
+                if leaf && !entries.is_empty() {
+                    progress.note_leaf(filters::path_depth(page_url.as_str()), files);
+                }
             }
-            // Looking at the queue costs a little, so only when the counts could
-            // condemn the site, and not at every folder.
+            // Not at every folder: looking at the queue costs a little.
             if let Some(thresholds) = early_judge
-                && dirs >= quality::PROBE_DIRS
+                && progress.folders_read >= quality::PROBE_DIRS
                 && dirs.is_multiple_of(PROBE_EVERY)
-                && counts.files >= quality::MIN_EVIDENCE
-                && counts.big == 0
-                && counts.useful * 20 < counts.files
             {
-                let deepest_waiting = queue
-                    .iter()
-                    .map(|(u, _)| filters::path_depth(u.as_str()))
-                    .max()
-                    .max(overflow_deepest);
-                let waiting = queue.len() as u64 + overflow_saved as u64;
-                if let Some(sample) =
-                    quality::sample(leaf_folders, deepest_leaf, waiting, deepest_waiting)
-                    && let Some(why) = thresholds.judge(&counts, sample)
-                {
+                let level = progress.level;
+                let waiting = || waiting_at(&queue, &overflow_depths, level);
+                if let Some(why) = thresholds.judge_crawling(&progress, waiting) {
                     return Some(Report {
                         status: HostStatus::LowValue,
                         server,
                         dirs,
                         reason: Some(why),
                         purge: true,
+                        failed: false,
                     });
                 }
             }
@@ -618,6 +693,10 @@ impl HostCrawl {
             return None; // untouched: its candidates stay for the next run
         }
         let unfinished = (stopped || budget_reached) && (!queue.is_empty() || overflow_saved > 0);
+        // Folders that could not be read wait for the next run, so a site with a few
+        // broken folders is not called finished.
+        let retry = !failed.is_empty();
+        let mut failed_run = false;
         let (status, reason) = match dirs {
             0 if self.robots_blocked.is_some() => {
                 (HostStatus::RobotsDisallowed, self.robots_blocked.take())
@@ -633,25 +712,40 @@ impl HostCrawl {
                     frontier: started_from,
                 };
                 let _ = self.tx.send(msg).await;
+                failed_run = true;
                 let why = format!("could not be reached this run ({error}); will try again");
                 (HostStatus::Paused, Some(why))
             }
             0 if self.last_error.is_some() => (HostStatus::Unreachable, self.last_error.take()),
+            // What a continued site had waiting is gone (deleted folders, dead links):
+            // it has been read as far as it can be, and what it holds is judged as final.
+            0 if !self.first_run => (HostStatus::Done, None),
             0 => (HostStatus::NotListing, None),
-            _ if gave_up.is_some() => (HostStatus::Partial, gave_up),
-            _ if unfinished => {
+            _ if gave_up.is_some() || unfinished || retry => {
+                let frontier = queue
+                    .into_iter()
+                    .map(|(url, _)| url)
+                    .chain(failed)
+                    .collect();
                 let msg = Msg::Paused {
                     host: self.host.clone(),
                     finished: started_from,
-                    frontier: queue.into_iter().map(|(url, _)| url).collect(),
+                    frontier,
                 };
                 let _ = self.tx.send(msg).await;
-                let why = if stopped {
-                    "stopped; continues next run"
+                let why = if let Some(why) = gave_up {
+                    failed_run = true;
+                    format!("{why}; continues next run")
+                } else if stopped {
+                    "stopped; continues next run".to_string()
+                } else if budget_reached {
+                    "directory budget for this run reached; continues next run".to_string()
                 } else {
-                    "directory budget for this run reached; continues next run"
+                    failed_run = true;
+                    let error = self.last_error.take().unwrap_or_default();
+                    format!("some folders could not be read ({error}); will try them again")
                 };
-                (HostStatus::Paused, Some(why.to_string()))
+                (HostStatus::Paused, Some(why))
             }
             _ => (HostStatus::Done, None),
         };
@@ -659,8 +753,9 @@ impl HostCrawl {
             status,
             server,
             dirs,
-            reason,
+            reason: with_truncation_note(reason, truncated, self.cfg.max_listing_bytes),
             purge: false,
+            failed: failed_run,
         })
     }
 
@@ -735,7 +830,7 @@ impl HostCrawl {
                 return Fetch::Failed(format!("{status} from {url}"));
             }
             if !status.is_success() {
-                return Fetch::Skipped;
+                return Fetch::Refused(format!("{status} from {url}"));
             }
 
             // Only listing pages are read. Anything else, including a response
@@ -753,14 +848,15 @@ impl HostCrawl {
                 return Fetch::Skipped;
             }
             let body = tokio::select! {
-                body = read_capped(response, MAX_BODY_BYTES) => body,
+                body = read_capped(response, self.cfg.max_listing_bytes) => body,
                 _ = self.stop.cancelled() => return Fetch::Stopped,
             };
             return match body {
-                Ok(body) => Fetch::Page(Page {
+                Ok((body, truncated)) => Fetch::Page(Page {
                     url,
                     content_type,
                     body: String::from_utf8_lossy(&body).into_owned(),
+                    truncated,
                 }),
                 Err(e) => Fetch::Failed(e.to_string()),
             };
@@ -875,7 +971,7 @@ impl HostCrawl {
                 body = read_capped(response, MAX_ROBOTS_BYTES) => body,
                 _ = self.stop.cancelled() => return None,
             };
-            let robots = match body.map(|b| Robot::new(BOT_TOKEN, &b)) {
+            let robots = match body.map(|(b, _)| Robot::new(BOT_TOKEN, &b)) {
                 Ok(Ok(robot)) => Robots::Rules(Box::new(robot)),
                 _ => Robots::DisallowAll("robots.txt could not be read".into()),
             };
@@ -925,16 +1021,18 @@ fn check_exposure(page_url: &Url, listing: &mut Listing, trusted: bool) -> Optio
     None
 }
 
-async fn read_capped(mut response: Response, cap: usize) -> reqwest::Result<Vec<u8>> {
+/// Reads a body up to `cap` bytes, and says whether there was more.
+async fn read_capped(mut response: Response, cap: usize) -> reqwest::Result<(Vec<u8>, bool)> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         let room = cap - body.len();
-        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        if body.len() >= cap {
-            break;
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            return Ok((body, true));
         }
+        body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok((body, false))
 }
 
 /// `Retry-After` in seconds (the HTTP-date form is ignored).
@@ -986,6 +1084,43 @@ impl Listings {
         earlier.push(here.to_string());
         looped
     }
+}
+
+/// The folders of a crawl that still wait, against the level of the deepest leaf
+/// folders read (see `quality::Waiting`): the queue in memory and the ones saved past
+/// the budget.
+fn waiting_at(
+    queue: &VecDeque<(Url, usize)>,
+    saved: &BTreeMap<usize, u64>,
+    level: Option<usize>,
+) -> Waiting {
+    let mut at_level = level.and_then(|l| saved.get(&l)).copied().unwrap_or(0);
+    let mut deepest = saved.keys().next_back().copied();
+    for (url, _) in queue {
+        let depth = filters::path_depth(url.as_str());
+        deepest = deepest.max(Some(depth));
+        at_level += u64::from(Some(depth) == level);
+    }
+    Waiting { at_level, deepest }
+}
+
+/// Adds to a host's reason that listings were cut short, if any were.
+fn with_truncation_note(reason: Option<String>, truncated: u32, cap: usize) -> Option<String> {
+    if truncated == 0 {
+        return reason;
+    }
+    let note = format!(
+        "{truncated} listing(s) were longer than {} and cut short",
+        if cap >= 1024 * 1024 {
+            format!("{} MiB", cap / (1024 * 1024))
+        } else {
+            format!("{} KiB", cap / 1024)
+        }
+    );
+    Some(match reason {
+        Some(reason) => format!("{reason}; {note}"),
+        None => note,
+    })
 }
 
 fn has_repeating_segments(path: &str) -> bool {

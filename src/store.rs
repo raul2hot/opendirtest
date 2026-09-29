@@ -22,7 +22,7 @@ use url::Url;
 
 use crate::filters::{self, Sensitivity};
 use crate::listing::Entry;
-use crate::quality::{self, Counts, Sample, Thresholds};
+use crate::quality::{self, Counts, Progress, Thresholds, Waiting};
 use crate::safety::{DROP_SENSITIVE_EXPOSURES, HONOR_OPT_OUT_LIST, HONOR_TAKEDOWN_LIST};
 
 const SCHEMA: &str = r#"
@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS hosts (
     crawled_at INTEGER NOT NULL,
     reason     TEXT,
     -- 1 for sites you added yourself (seeds): never judged by the quality check.
-    trusted    INTEGER NOT NULL DEFAULT 0
+    trusted    INTEGER NOT NULL DEFAULT 0,
+    -- Runs in a row of a paused site that ended in errors (see `MAX_FAILED_RUNS`).
+    fails      INTEGER NOT NULL DEFAULT 0
 );
 
 -- One row per folder listing that was read.
@@ -177,6 +179,10 @@ pub enum Msg {
         /// Judge what is stored for the host by these thresholds, and drop it as
         /// low value if it fails. `None` for trusted sites.
         judge: Option<Thresholds>,
+        /// The run ended because of errors or refusals, not because the crawl is
+        /// over. A site that continues stays paused and counts a strike; after
+        /// `MAX_FAILED_RUNS` such runs in a row it is ended.
+        failed: bool,
     },
     /// Directory URLs worth crawling later. Already-known URLs are ignored.
     Candidates { urls: Vec<Url>, source: String },
@@ -200,6 +206,9 @@ pub enum Msg {
 
 /// `candidates.source` for directories saved by a paused crawl.
 pub const RESUME_SOURCE: &str = "resume";
+
+/// A paused site whose runs end in errors this many times in a row is given up on.
+pub const MAX_FAILED_RUNS: i64 = 5;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -234,6 +243,14 @@ pub fn open(path: &Path) -> Result<Connection> {
              quality check may remove those that hold little. Sites in your seeds folder are \
              kept; put any other site you want to keep there."
         );
+    }
+    let has_fails: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('hosts') WHERE name = 'fails'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_fails {
+        conn.execute_batch("ALTER TABLE hosts ADD COLUMN fails INTEGER NOT NULL DEFAULT 0")?;
     }
     // Databases from before the leaf flag: a folder listing no sub-folder is a leaf.
     let has_leaf: bool = conn.query_row(
@@ -395,6 +412,7 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
             purge,
             trusted,
             judge,
+            failed,
         } => {
             // A site you added, or where one of yours moved to, is yours even if the
             // crawl that ends here did not know it yet.
@@ -402,9 +420,39 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
             if *purge {
                 purge_host(conn, host)?;
             }
+            // A run that ended in errors is a strike against a site that continues;
+            // a site that has had too many in a row is ended.
+            let mut status = *status;
+            let mut reason = reason.clone();
+            let mut fails = 0;
+            if status == HostStatus::Paused && *failed {
+                let before: i64 = conn
+                    .query_row("SELECT fails FROM hosts WHERE host = ?1", [host], |row| {
+                        row.get(0)
+                    })
+                    .unwrap_or(0);
+                fails = before + 1;
+                if fails >= MAX_FAILED_RUNS {
+                    let read: bool = conn.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM dirs WHERE host = ?1)",
+                        [host],
+                        |row| row.get(0),
+                    )?;
+                    status = if read {
+                        HostStatus::Partial
+                    } else {
+                        HostStatus::Unreachable
+                    };
+                    let last = reason.as_deref().unwrap_or("errors");
+                    reason = Some(format!(
+                        "gave up after {fails} runs in a row that ended in errors ({last})"
+                    ));
+                    fails = 0;
+                }
+            }
             conn.execute(
-                "INSERT INTO hosts (host, status, server, dirs, files, bytes, crawled_at, reason, trusted)
-                 SELECT ?1, ?2, ?3, ?4, count(e.id), CAST(total(e.size) AS INTEGER), ?5, ?6, ?7
+                "INSERT INTO hosts (host, status, server, dirs, files, bytes, crawled_at, reason, trusted, fails)
+                 SELECT ?1, ?2, ?3, ?4, count(e.id), CAST(total(e.size) AS INTEGER), ?5, ?6, ?7, ?8
                  FROM dirs d JOIN entries e ON e.dir_id = d.id AND e.is_dir = 0
                  WHERE d.host = ?1
                  ON CONFLICT(host) DO UPDATE SET
@@ -413,16 +461,13 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
                         + CASE WHEN hosts.status = 'paused' THEN hosts.dirs ELSE 0 END,
                     files = excluded.files, bytes = excluded.bytes,
                     crawled_at = excluded.crawled_at, reason = excluded.reason,
-                    trusted = max(hosts.trusted, excluded.trusted)",
-                params![host, status.as_str(), server, *dirs as i64, now, reason, trusted],
+                    trusted = max(hosts.trusted, excluded.trusted), fails = excluded.fails",
+                params![host, status.as_str(), server, *dirs as i64, now, reason, trusted, fails],
             )?;
-            if *status != HostStatus::Paused {
+            if status != HostStatus::Paused {
                 conn.execute("DELETE FROM candidates WHERE host = ?1", [host])?;
             }
-            // Judge everything stored for the site, across runs. A site that is
-            // still being crawled is judged on its leaf folders only; one that gave
-            // up or vanished will not be crawled again, so what it holds is final,
-            // but it is dropped only when plainly junk.
+            // Judge everything stored for the site, across runs (see `verdict`).
             let judged = matches!(
                 status,
                 HostStatus::Done
@@ -432,7 +477,7 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
                     | HostStatus::NotListing
             );
             if let (Some(thresholds), true, false) = (judge, judged, trusted)
-                && let Some(why) = verdict(conn, host, *status, *thresholds)?
+                && let Some(why) = verdict(conn, host, status, *thresholds)?
             {
                 mark_host(conn, host, HostStatus::LowValue, &why)?;
             }
@@ -570,49 +615,14 @@ fn purge_host(conn: &Connection, host: &str) -> Result<usize> {
     Ok(files)
 }
 
-/// What a site holds, counted over its stored files, and how far that can be
-/// trusted to speak for the whole site.
-///
-/// A site that is still being crawled (`paused`) has only shown its top so far:
-/// a big archive's first folders hold README and index files, and the downloads
-/// are further down. So only leaf folders count, and the sample is judged by
-/// `quality::sample` against the folders still waiting. `None`: too little seen
-/// to say anything. A site that gave up or is gone will not be crawled again, so
-/// all its files count, and a finished one is judged by the full thresholds.
-fn evidence(conn: &Connection, host: &str, status: HostStatus) -> Result<Option<(Counts, Sample)>> {
-    let paused = status == HostStatus::Paused;
-    let sample = if status == HostStatus::Done {
-        Sample::Final
-    } else if paused {
-        let (leaves, deepest_leaf): (i64, Option<i64>) = conn.query_row(
-            "SELECT count(*), max(url_depth(url)) FROM dirs WHERE host = ?1 AND leaf = 1",
-            [host],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let (waiting, deepest_waiting): (i64, Option<i64>) = conn.query_row(
-            "SELECT count(*), max(url_depth(url)) FROM candidates WHERE host = ?1",
-            [host],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let depth = |d: Option<i64>| d.map(|d| d as usize);
-        match quality::sample(
-            leaves as u64,
-            depth(deepest_leaf),
-            waiting as u64,
-            depth(deepest_waiting),
-        ) {
-            Some(sample) => sample,
-            None => return Ok(None),
-        }
-    } else {
-        Sample::Representative
-    };
-    let counts = conn.query_row(
+/// What is stored for a site, counted over all its files.
+fn all_counts(conn: &Connection, host: &str) -> Result<Counts> {
+    Ok(conn.query_row(
         "SELECT count(e.id), coalesce(sum(e.size >= ?2), 0),
                 coalesce(sum(is_useful(e.name, e.size)), 0)
          FROM dirs d JOIN entries e ON e.dir_id = d.id AND e.is_dir = 0
-         WHERE d.host = ?1 AND (?3 = 0 OR d.leaf = 1)",
-        params![host, quality::BIG_FILE as i64, paused],
+         WHERE d.host = ?1",
+        params![host, quality::BIG_FILE as i64],
         |row| {
             Ok(Counts {
                 files: row.get::<_, i64>(0)? as u64,
@@ -620,22 +630,85 @@ fn evidence(conn: &Connection, host: &str, status: HostStatus) -> Result<Option<
                 useful: row.get::<_, i64>(2)? as u64,
             })
         },
+    )?)
+}
+
+/// What has been read of a site that is still being crawled, as it is stored:
+/// the same numbers the crawler keeps in memory.
+fn progress_of(conn: &Connection, host: &str) -> Result<Progress> {
+    let level: Option<i64> = conn.query_row(
+        "SELECT max(url_depth(url)) FROM dirs WHERE host = ?1 AND leaf = 1",
+        [host],
+        |row| row.get(0),
     )?;
-    Ok(Some((counts, sample)))
+    let (level_folders, level_files) = match level {
+        Some(level) => conn.query_row(
+            "SELECT count(DISTINCT d.id), count(e.id)
+             FROM dirs d LEFT JOIN entries e ON e.dir_id = d.id AND e.is_dir = 0
+             WHERE d.host = ?1 AND d.leaf = 1 AND url_depth(d.url) = ?2",
+            params![host, level],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?,
+        None => (0, 0),
+    };
+    let all = all_counts(conn, host)?;
+    let folders_read: i64 = conn.query_row(
+        "SELECT coalesce((SELECT dirs FROM hosts WHERE host = ?1), 0)",
+        [host],
+        |row| row.get(0),
+    )?;
+    Ok(Progress {
+        level: level.map(|l| l as usize),
+        level_folders: level_folders as u64,
+        level_files: level_files as u64,
+        all_files: all.files,
+        big: all.big,
+        useful: all.useful,
+        folders_read: folders_read as u64,
+    })
+}
+
+/// The folders still waiting for a site, against the level of its deepest leaves.
+fn waiting_of(conn: &Connection, host: &str, level: Option<usize>) -> Result<Waiting> {
+    let deepest: Option<i64> = conn.query_row(
+        "SELECT max(url_depth(url)) FROM candidates WHERE host = ?1",
+        [host],
+        |row| row.get(0),
+    )?;
+    let at_level: i64 = match level {
+        Some(level) => conn.query_row(
+            "SELECT count(*) FROM candidates WHERE host = ?1 AND url_depth(url) = ?2",
+            params![host, level as i64],
+            |row| row.get(0),
+        )?,
+        None => 0,
+    };
+    Ok(Waiting {
+        at_level: at_level as u64,
+        deepest: deepest.map(|d| d as usize),
+    })
 }
 
 /// `Some(reason)` if what is stored for the site is too little to keep. The one
-/// place that decides, for the writer at the end of a crawl and for `clean`.
+/// place that decides, for the writer at the end of a crawl and for `clean`. A
+/// finished site is judged by the thresholds; one still being crawled only on
+/// strong, fair evidence (`Thresholds::judge_crawling`); one that gave up or is
+/// gone only when plainly junk (`Thresholds::judge_ended`).
 fn verdict(
     conn: &Connection,
     host: &str,
     status: HostStatus,
     thresholds: Thresholds,
 ) -> Result<Option<String>> {
-    Ok(
-        evidence(conn, host, status)?
-            .and_then(|(counts, sample)| thresholds.judge(&counts, sample)),
-    )
+    Ok(match status {
+        HostStatus::Paused => {
+            let progress = progress_of(conn, host)?;
+            let waiting = waiting_of(conn, host, progress.level)?;
+            thresholds.judge_crawling(&progress, || waiting)
+        }
+        HostStatus::Done => thresholds.judge_final(&all_counts(conn, host)?),
+        _ => thresholds.judge_ended(&all_counts(conn, host)?),
+    })
 }
 
 /// True if the site has a waiting URL that you added, or that a site you added
@@ -660,6 +733,7 @@ fn mark_host(conn: &Connection, host: &str, status: HostStatus, reason: &str) ->
         purge: true,
         trusted: false,
         judge: None,
+        failed: false,
     };
     apply(conn, &msg)
 }
@@ -736,8 +810,14 @@ pub fn named_sites(conn: &Connection, urls: &[Url]) -> Result<Vec<PendingHost>> 
         let at = match sites.iter().position(|site| site.host == host) {
             Some(at) => at,
             None => {
+                let known = host_is_paused(conn, &host)?;
                 sites.push(PendingHost {
-                    known: host_is_paused(conn, &host)?,
+                    progress: if known {
+                        Some(progress_of(conn, &host)?)
+                    } else {
+                        None
+                    },
+                    known,
                     host,
                     urls: Vec::new(),
                     seeds: Vec::new(),
@@ -808,7 +888,8 @@ fn insert_candidates(conn: &Connection, urls: &[Url], source: &str, now: i64) ->
 /// The URLs waiting for a site, shortest first, and whether you added each one.
 fn waiting_urls(conn: &Connection, host: &str) -> Result<Vec<(Url, bool)>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT url, source = 'seed' FROM candidates WHERE host = ?1 ORDER BY length(url), url",
+        "SELECT url, source = 'seed' FROM candidates WHERE host = ?1
+         ORDER BY url_depth(url), rowid",
     )?;
     let rows = stmt
         .query_map([host], |row| {
@@ -837,6 +918,8 @@ pub struct PendingHost {
     /// It was crawled before and paused, so this run continues it: its first
     /// folders are the frontier saved then.
     pub known: bool,
+    /// What was read of it in earlier runs, for a site that continues.
+    pub progress: Option<Progress>,
 }
 
 /// Up to `want` sites with work to do, skipping `exclude` (sites already being
@@ -883,6 +966,11 @@ pub fn pending_hosts(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         hosts.push(PendingHost {
+            progress: if known {
+                Some(progress_of(conn, &host)?)
+            } else {
+                None
+            },
             seeds: waiting
                 .iter()
                 .filter(|(_, is_seed)| *is_seed)
@@ -1528,6 +1616,7 @@ mod tests {
             purge: true,
             trusted: false,
             judge: None,
+            failed: false,
         };
         apply(&conn, &done).unwrap();
         assert!(files(&conn).is_empty());
@@ -1594,6 +1683,7 @@ mod tests {
             purge: false,
             trusted,
             judge,
+            failed: false,
         };
         apply(conn, &done).unwrap();
     }
@@ -1791,6 +1881,7 @@ mod tests {
             purge: false,
             trusted: false,
             judge: t,
+            failed: false,
         };
         apply(&conn, &paused).unwrap();
         assert_eq!(status(&conn, "early.example"), "paused");
@@ -1884,6 +1975,26 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_a_database_without_the_failed_runs_column() {
+        let path = temp_path("no-fails");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE hosts (host TEXT PRIMARY KEY, status TEXT NOT NULL, server TEXT,
+                 dirs INTEGER NOT NULL DEFAULT 0, files INTEGER NOT NULL DEFAULT 0,
+                 bytes INTEGER NOT NULL DEFAULT 0, crawled_at INTEGER NOT NULL, reason TEXT,
+                 trusted INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO hosts VALUES ('old.example', 'paused', NULL, 3, 10, 99, 0, NULL, 0);",
+            )
+            .unwrap();
+        let conn = open(&path).unwrap();
+        assert_eq!(fails(&conn, "old.example"), 0);
+        // And it counts from there.
+        run_ended(&conn, "old.example", HostStatus::Paused, true);
+        assert_eq!(fails(&conn, "old.example"), 1);
+    }
+
+    #[test]
     fn pending_hosts_skip_finished_and_busy_hosts() {
         let conn = open(&temp_path("candidates")).unwrap();
         let urls = [
@@ -1913,6 +2024,7 @@ mod tests {
             purge: false,
             trusted: false,
             judge: None,
+            failed: false,
         };
         apply(&conn, &done).unwrap();
 
@@ -1979,6 +2091,7 @@ mod tests {
             purge: false,
             trusted: false,
             judge: None,
+            failed: false,
         };
         apply(&conn, &status).unwrap();
 
@@ -2004,6 +2117,7 @@ mod tests {
             purge: false,
             trusted: false,
             judge: None,
+            failed: false,
         };
         apply(&conn, &done).unwrap();
         let dirs: i64 = conn
@@ -2065,6 +2179,7 @@ mod tests {
             purge: false,
             trusted,
             judge,
+            failed: false,
         };
         apply(conn, &msg).unwrap();
     }
@@ -2645,8 +2760,8 @@ mod tests {
         pause("wide.example", many);
         assert_eq!(status(&conn, "wide.example"), "paused");
 
-        // Overwhelming junk is judged whatever waits: 2,500 files, nothing big,
-        // nothing useful, in 25 folders, with a deeper folder still waiting.
+        // A lot of junk (2,500 files in 25 folders) with a deeper folder still
+        // waiting is not judged either: the downloads may be down there.
         let hundred: Vec<(String, Option<u64>)> = (0..100)
             .map(|i| (format!("t{i}.jpg"), Some(30_000)))
             .collect();
@@ -2655,8 +2770,55 @@ mod tests {
             "huge.example",
             vec!["https://huge.example/pub/a/b/c/".into()],
         );
-        assert_eq!(status(&conn, "huge.example"), "low_value");
-        // ...unless one file among them is useful.
+        assert_eq!(status(&conn, "huge.example"), "paused");
+
+        // Only a site that has cost 2,000 folders is dropped whatever waits, and only
+        // if under 1% of what it holds is useful (and it is not kept by the
+        // thresholds: 20 useful files or 3 big ones).
+        let long_read = |host: &str, extra: &[(String, Option<u64>)]| {
+            leaves(&conn, host, "pub", 10, &borrowed(&hundred));
+            if !extra.is_empty() {
+                put(&conn, host, "pub/extra", &borrowed(extra));
+            }
+            let msg = Msg::Paused {
+                host: host.into(),
+                finished: vec![],
+                frontier: vec![url(&format!("https://{host}/pub/a/b/c/"))],
+            };
+            apply(&conn, &msg).unwrap();
+            let done = Msg::HostDone {
+                host: host.into(),
+                status: HostStatus::Paused,
+                server: None,
+                dirs: quality::HARD_FOLDERS,
+                reason: None,
+                purge: false,
+                trusted: false,
+                judge: t,
+                failed: false,
+            };
+            apply(&conn, &done).unwrap();
+        };
+        let isos = |n: usize| -> Vec<(String, Option<u64>)> {
+            (0..n).map(|i| (format!("d{i}.iso"), Some(1_000))).collect()
+        };
+        long_read("endless.example", &[]);
+        assert_eq!(status(&conn, "endless.example"), "low_value");
+        long_read("stray.example", &isos(1));
+        assert_eq!(status(&conn, "stray.example"), "low_value");
+        // 15 useful files among 1,015 (1.5%): not enough to keep the site, but too
+        // many to call it endless junk.
+        long_read("share.example", &isos(15));
+        assert_eq!(status(&conn, "share.example"), "paused");
+        // With the same numbers but fewer folders read, nothing is judged.
+        leaves(&conn, "young.example", "pub", 10, &borrowed(&hundred));
+        pause(
+            "young.example",
+            vec!["https://young.example/pub/a/b/c/".into()],
+        );
+        assert_eq!(status(&conn, "young.example"), "paused");
+
+        // One useful file among the junk keeps a site that has not cost that much.
         let mut with_iso = borrowed(&hundred);
         with_iso.push(("a.iso", Some(1_000)));
         leaves(&conn, "mixed.example", "pub", 25, &with_iso);
@@ -2665,6 +2827,95 @@ mod tests {
             vec!["https://mixed.example/pub/a/b/c/".into()],
         );
         assert_eq!(status(&conn, "mixed.example"), "paused");
+    }
+
+    fn fails(conn: &Connection, host: &str) -> i64 {
+        conn.query_row("SELECT fails FROM hosts WHERE host = ?1", [host], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    fn run_ended(conn: &Connection, host: &str, status: HostStatus, failed: bool) {
+        let msg = Msg::HostDone {
+            host: host.into(),
+            status,
+            server: None,
+            dirs: 1,
+            reason: Some("could not be reached this run".into()),
+            purge: false,
+            trusted: false,
+            judge: Some(Thresholds::default()),
+            failed,
+        };
+        apply(conn, &msg).unwrap();
+    }
+
+    #[test]
+    fn a_paused_site_is_given_up_after_five_runs_in_a_row_that_ended_in_errors() {
+        let conn = open(&temp_path("strikes")).unwrap();
+        let isos = [
+            ("a.iso", Some(4_000_000_000)),
+            ("b.iso", Some(4_000_000_000)),
+            ("c.iso", Some(4_000_000_000)),
+        ];
+        put(&conn, "flaky.example", "pub", &isos);
+        for run in 1..=4 {
+            run_ended(&conn, "flaky.example", HostStatus::Paused, true);
+            assert_eq!(status(&conn, "flaky.example"), "paused");
+            assert_eq!(fails(&conn, "flaky.example"), run);
+        }
+        // A run that ends without errors starts the count again.
+        run_ended(&conn, "flaky.example", HostStatus::Paused, false);
+        assert_eq!(fails(&conn, "flaky.example"), 0);
+        for _ in 0..5 {
+            run_ended(&conn, "flaky.example", HostStatus::Paused, true);
+        }
+        // What was read stays, and the site is not crawled again.
+        assert_eq!(status(&conn, "flaky.example"), "partial");
+        let why: String = conn
+            .query_row(
+                "SELECT reason FROM hosts WHERE host = 'flaky.example'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(why.contains("gave up after 5 runs"), "{why}");
+        assert_eq!(fails(&conn, "flaky.example"), 0);
+        assert_eq!(search_count(&conn, "a.iso"), 1);
+
+        // A paused site with nothing stored ends as unreachable.
+        for _ in 0..5 {
+            run_ended(&conn, "gone.example", HostStatus::Paused, true);
+        }
+        assert_eq!(status(&conn, "gone.example"), "unreachable");
+
+        // Failing runs of a site you added end it the same way, and are not judged.
+        put(&conn, "mine.example", "pub", &isos);
+        let msg = |failed| Msg::HostDone {
+            host: "mine.example".into(),
+            status: HostStatus::Paused,
+            server: None,
+            dirs: 1,
+            reason: None,
+            purge: false,
+            trusted: true,
+            judge: Some(Thresholds::default()),
+            failed,
+        };
+        for _ in 0..5 {
+            apply(&conn, &msg(true)).unwrap();
+        }
+        assert_eq!(status(&conn, "mine.example"), "partial");
+    }
+
+    fn search_count(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM entries WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3205,6 +3456,7 @@ mod tests {
             purge: true,
             trusted: false,
             judge: None,
+            failed: false,
         };
         apply(&conn, &dropped).unwrap();
 

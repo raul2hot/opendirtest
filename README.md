@@ -107,26 +107,43 @@ Try `discover --files 1` first to see what one index file costs on your connecti
 Only sites that hold real downloads are kept. A site you did not add is dropped, and
 its listings deleted, unless it has at least **3 files of 10 MiB or more**, or at least
 **20 files of a useful kind** (disk images, archives, installers, documents, ebooks,
-audio, video, data files). Web page files (html, php, js, css, jpg, png, ...) do not
-count, and a text file counts only if it is at least 100 KiB (a book or a dataset, not a
-readme).
+audio, video, data files). Web page files (html, php, js, css, jpg, png, ...) are not a
+useful kind (though a file of 10 MiB or more is big whatever it is), a text file counts
+only if it is at least 100 KiB (a book or a dataset, not a readme), and a compressed log
+(`access.log.3.gz`) is not an archive.
 
-The check is careful with sites that are not finished. A big archive's top folders hold
-README and index files, and its downloads are further down. So a site that is still being
-crawled is judged only on its leaf folders (folders with nothing below them to crawl), from
-at least 20 different folders, and only when that sample is a fair one: its leaves are as
-deep as the deepest folder still waiting, and there are at least as many of them as folders
-waiting (siblings not looked at yet can differ). Then it is dropped only when plainly junk:
-at least 100 such files, none of them big, and under 5% of a useful kind. Anything closer to
-the line waits for the verdict when the site is finished. A site so big that it never gets
-a fair sample is still dropped on overwhelming evidence, 2,000 files in leaf folders with
-nothing big and nothing useful among them, which also bounds what junk can cost.
+A site that is finished is judged by that rule. One that is still being crawled is
+dropped early only when it is junk beyond doubt, because an archive's downloads can be
+anywhere: in its top folders, or many levels down next to small folders of docs and
+pictures. Every big file and every useful file counts, in whatever folder it was found,
+and a site with even one big file is never dropped early. Otherwise it is dropped when
 
-A site that gave up after errors, or is not a listing any more, will not be crawled again,
-so what it holds is final: it is dropped when plainly junk, counting every file. A site that
-was paused and cannot be reached in a later run (down for the night, a server error on its
-last folders) is not ended: it stays paused with the folders it had waiting, and is tried
-again the next night.
+- the folders with nothing below them at the deepest level read so far (where downloads
+  hide; the layers above are README and picture folders) are a fair sample: at least 20
+  of them, nothing waiting deeper, and at least as many read as still wait (siblings not
+  looked at yet can differ), and they hold at least 100 files of which under 5% (in the
+  whole site) are of a useful kind; or
+- it has cost 2,000 folders and under 1% of what it holds is useful, whatever waits. This
+  bounds what an endless site (a calendar that links to next month for ever) can cost.
+
+Anything closer to the line waits for the verdict when the site is finished. A site that
+continues from an earlier run is judged the same way, from what its earlier runs read.
+
+Errors do not end a site at once. A run stops after 5 errors in a row, or 50 folders in a
+row that the server refuses (403, 404, ...: it is blocking us, or the listing is full of
+dead links), and the site stays paused with the folders that failed, to be tried again
+the next night. A site that read everything it could but had a few folders fail also
+stays paused until they are read. After 5 runs in a row that end in errors the site is
+given up and keeps what it has (`partial`, or `unreachable` if nothing was read); it is
+dropped if that is plainly junk: at least 100 files, none big, under 5% useful. A single
+dead link among live folders is skipped, not retried.
+
+The per-run budget (`--max-dirs`, 5,000 folders by default) counts every folder asked for,
+whether or not it answered. A listing page is read up to 32 MiB (a folder of 50,000 files
+is about 10 MB); a longer one is cut short, and the site's reason says so. If the only
+address a site was found by is inside a skipped folder (a link into a mirror's `/pool/`),
+the crawl starts from the site's front page instead.
+
 Change the limits with `--min-big`, `--min-useful`, or `--keep-all`.
 
 Sites are also dropped when a listing looks like an accidental exposure or a broken-into

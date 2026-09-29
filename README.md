@@ -60,8 +60,10 @@ edit, one folder URL per line:
 lists next to them.
 
 Sites you add are **trusted**: they are never dropped for holding too little (see below).
-If a seed has moved, so that its address redirects to another site, the new address is
-trusted too (up to 3 new addresses per site, so one site cannot fill the queue).
+If an address you added has moved, so that it redirects to another site, the new address
+is trusted too. That goes one step only (the new address cannot pass trust on again), for
+at most 3 addresses per site, and only for addresses you added: a folder inside a site that
+redirects elsewhere is just a link.
 I could not open most of these addresses from where I wrote them, so a few may not be
 plain listings. After the first run, `opendir sites --status not_listing` and
 `--status unreachable` show which ones did not work; delete those lines.
@@ -111,9 +113,12 @@ readme).
 
 The check is careful with sites that are not finished. A big archive's top folders hold
 README and index files, and its downloads are further down. So a site that is still being
-crawled is judged only on its folders that have no sub-folders, and is dropped only when
-that is plainly junk: at least 100 such files, none of them big, and under 5% of a useful
-kind. Anything closer to the line waits for the verdict when the site is finished.
+crawled is judged only on its leaf folders (folders with nothing below them to crawl), and
+only once the crawl has reached leaves as deep as the deepest folder still waiting. It is
+dropped only when that is plainly junk: at least 100 such files, none of them big, and
+under 5% of a useful kind. Anything closer to the line waits for the verdict when the site
+is finished. A site that gave up after errors, or vanished, will not be crawled again, so
+what it holds is final: it is dropped when plainly junk, counting every file.
 Change the limits with `--min-big`, `--min-useful`, or `--keep-all`.
 
 Sites are also dropped when a listing looks like an accidental exposure or a broken-into
@@ -208,7 +213,8 @@ A database from just before the quality check is upgraded in place, and opendir 
 It cannot know which of its sites you added yourself, so they all count as found by
 discovery, and the check may remove those that hold little. Sites in your `seeds` folder
 are kept. Put any other site you want to keep there, or crawl it once by name with
-`crawl URL`, which marks it as yours before the check runs.
+`crawl URL`, which records it as one of yours before the check runs (and also crawls the
+folders it has waiting from earlier runs, which finishing would otherwise discard).
 
 ## Commands
 
@@ -247,9 +253,10 @@ SQLite tool.
   `http.server` and Caddy (asks Caddy for JSON). Pages with a custom title or header are
   recognised by Apache's sort links, or by their links (a name and a date next to each).
   Pages that are not listings are skipped.
-- **Loop guards:** a directory whose listing matches one already seen on that site (for
-  example a symlink back to its parent) is indexed but not descended into. There are
-  also depth, URL length and per-site budget limits.
+- **Loop guards:** a directory whose listing has files and matches one already seen on
+  that site (for example a symlink back to its parent) is indexed but not descended into.
+  Folders that hold nothing but sub-folders are never taken for copies, since folders made
+  together look alike. There are also depth, URL length and per-site budget limits.
 - **Search-time filters:** names that look like pirated media or cracked software, and
   URLs on the takedown list, are hidden from results but not from the crawl.
 

@@ -14,6 +14,8 @@ use regex::Regex;
 use serde::Deserialize;
 use url::Url;
 
+use crate::filters;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub url: Url,
@@ -250,6 +252,10 @@ fn parse_html(base: &Url, body: &str) -> Option<Listing> {
         url.set_fragment(None);
         if !matches!(url.scheme(), "http" | "https") || url.query().is_some() {
             continue; // sort links like ?C=N;O=D
+        }
+        // The same site spelled another way (`example.com.`) is still this site.
+        if url.host_str() != base.host_str() && filters::same_site(&url, base) {
+            let _ = url.set_host(base.host_str());
         }
         if url.host_str() != base.host_str() {
             if url.path().ends_with('/') {
@@ -931,6 +937,24 @@ mod tests {
                 ("paper.pdf", false, None, None)
             ]
         );
+    }
+
+    #[test]
+    fn a_link_that_spells_the_host_with_a_trailing_dot_is_still_this_site() {
+        let base = Url::parse("https://mirror.example.org/pub/").unwrap();
+        let page = "<html><head><title>Index of /pub</title></head><body><pre>\n\
+            <a href=\"https://mirror.example.org./pub/iso/\">iso/</a>  28-Sep-2026 10:15  -\n\
+            <a href=\"https://other.example.net/pub/\">other/</a>  28-Sep-2026 10:15  -\n\
+            </pre></body></html>";
+        let listing = parse(&base, Some("text/html"), page).unwrap();
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["iso"]);
+        assert_eq!(
+            listing.entries[0].url.as_str(),
+            "https://mirror.example.org/pub/iso/"
+        );
+        // A real other site is still only recorded for later.
+        assert_eq!(listing.external_dirs.len(), 1);
     }
 
     #[test]

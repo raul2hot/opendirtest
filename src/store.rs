@@ -47,7 +47,11 @@ CREATE TABLE IF NOT EXISTS dirs (
     id      INTEGER PRIMARY KEY,
     host    TEXT NOT NULL,
     url     TEXT NOT NULL UNIQUE,
-    seen_at INTEGER NOT NULL
+    seen_at INTEGER NOT NULL,
+    -- 1 if the crawl visits nothing below this folder (it lists no sub-folder to
+    -- crawl, now or later). Only such folders count when a site that is still
+    -- being crawled is judged: see `host_counts`.
+    leaf    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS dirs_host ON dirs(host);
 
@@ -135,6 +139,10 @@ pub enum Msg {
     Entries {
         host: String,
         entries: Vec<Entry>,
+        /// The crawl visits nothing below this folder: it lists no sub-folder to
+        /// crawl (skipped, blocked or too deep ones do not count), and it is not a
+        /// copy of a folder seen before.
+        leaf: bool,
     },
     HostDone {
         host: String,
@@ -153,10 +161,7 @@ pub enum Msg {
         judge: Option<Thresholds>,
     },
     /// Directory URLs worth crawling later. Already-known URLs are ignored.
-    Candidates {
-        urls: Vec<Url>,
-        source: String,
-    },
+    Candidates { urls: Vec<Url>, source: String },
     /// A crawl stopped before finishing: the candidates it started from are
     /// done, and `frontier` is what is left to crawl next time.
     Paused {
@@ -212,11 +217,24 @@ pub fn open(path: &Path) -> Result<Connection> {
              kept; put any other site you want to keep there."
         );
     }
+    // Databases from before the leaf flag: a folder listing no sub-folder is a leaf.
+    let has_leaf: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('dirs') WHERE name = 'leaf'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_leaf {
+        conn.execute_batch(
+            "ALTER TABLE dirs ADD COLUMN leaf INTEGER NOT NULL DEFAULT 0;
+             UPDATE dirs SET leaf = 1 WHERE NOT EXISTS (
+                 SELECT 1 FROM entries s WHERE s.dir_id = dirs.id AND s.is_dir = 1);",
+        )?;
+    }
     Ok(conn)
 }
 
-/// SQL functions used by the cleanup queries: `is_useful(name, size)` and
-/// `sensitivity(name)` (0 none, 1 weak, 2 strong).
+/// SQL functions used by the cleanup queries: `is_useful(name, size)`,
+/// `url_depth(url)` and `sensitivity(name)` (0 none, 1 weak, 2 strong).
 fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
     conn.create_scalar_function("is_useful", 2, flags, |ctx| {
@@ -228,6 +246,9 @@ fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
             .ok()
             .and_then(|s| u64::try_from(s).ok());
         Ok(quality::is_useful(name, size))
+    })?;
+    conn.create_scalar_function("url_depth", 1, flags, |ctx| {
+        Ok(filters::path_depth(ctx.get_raw(0).as_str().unwrap_or("")) as i64)
     })?;
     conn.create_scalar_function("sensitivity", 1, flags, |ctx| {
         Ok(
@@ -338,7 +359,11 @@ fn is_busy(e: &rusqlite::Error) -> bool {
 fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
     let now = unix_now();
     match msg {
-        Msg::Entries { host, entries } => store_listing(conn, host, entries, now)?,
+        Msg::Entries {
+            host,
+            entries,
+            leaf,
+        } => store_listing(conn, host, entries, *leaf, now)?,
         Msg::HostDone {
             host,
             status,
@@ -349,6 +374,9 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
             trusted,
             judge,
         } => {
+            // A site you added, or where one of yours moved to, is yours even if the
+            // crawl that ends here did not know it yet.
+            let trusted = *trusted || has_trust_marker(conn, host)?;
             if *purge {
                 purge_host(conn, host)?;
             }
@@ -364,22 +392,32 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
                     files = excluded.files, bytes = excluded.bytes,
                     crawled_at = excluded.crawled_at, reason = excluded.reason,
                     trusted = max(hosts.trusted, excluded.trusted)",
-                params![host, status.as_str(), server, *dirs as i64, now, reason, *trusted],
+                params![host, status.as_str(), server, *dirs as i64, now, reason, trusted],
             )?;
             if *status != HostStatus::Paused {
                 conn.execute("DELETE FROM candidates WHERE host = ?1", [host])?;
             }
-            // Judge everything stored for the site, across runs.
+            // Judge everything stored for the site, across runs. A site that is
+            // still being crawled is judged on its leaf folders only; one that gave
+            // up or vanished will not be crawled again, so what it holds is final,
+            // but it is dropped only when plainly junk.
             let judged = matches!(
                 status,
-                HostStatus::Done | HostStatus::Paused | HostStatus::Partial
+                HostStatus::Done
+                    | HostStatus::Paused
+                    | HostStatus::Partial
+                    | HostStatus::Unreachable
+                    | HostStatus::NotListing
             );
-            let finished = *status == HostStatus::Done;
-            if let (Some(thresholds), true) = (judge, judged)
-                && let Some(why) = thresholds.judge(&host_counts(conn, host, !finished)?, finished)
-            {
-                mark_host(conn, host, HostStatus::LowValue, &why)?;
+            if let (Some(thresholds), true, false) = (judge, judged, trusted) {
+                let counts = host_counts(conn, host, *status == HostStatus::Paused)?;
+                if let Some(why) = thresholds.judge(&counts, *status == HostStatus::Done) {
+                    mark_host(conn, host, HostStatus::LowValue, &why)?;
+                }
             }
+        }
+        Msg::Candidates { urls, source } if source == MOVED_SOURCE => {
+            add_trusted(conn, urls, MOVED_SOURCE)?;
         }
         Msg::Candidates { urls, source } => insert_candidates(conn, urls, source, now)?,
         Msg::Paused {
@@ -415,7 +453,13 @@ fn apply(conn: &Connection, msg: &Msg) -> Result<()> {
 
 /// Stores one listing. A listing read again replaces what was stored for it,
 /// so files that disappeared from the server disappear here too.
-fn store_listing(conn: &Connection, host: &str, entries: &[Entry], now: i64) -> Result<()> {
+fn store_listing(
+    conn: &Connection,
+    host: &str,
+    entries: &[Entry],
+    leaf: bool,
+    now: i64,
+) -> Result<()> {
     // Folder URL -> (id, decoded path for the search index). All entries of a
     // listing share one folder, but don't rely on it.
     let mut dirs: HashMap<String, (i64, String)> = HashMap::new();
@@ -428,10 +472,10 @@ fn store_listing(conn: &Connection, host: &str, entries: &[Entry], now: i64) -> 
         let (dir_url, href) = split_url(&e.url);
         if !dirs.contains_key(&dir_url) {
             let id: i64 = conn.query_row(
-                "INSERT INTO dirs (host, url, seen_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(url) DO UPDATE SET seen_at = excluded.seen_at
+                "INSERT INTO dirs (host, url, seen_at, leaf) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(url) DO UPDATE SET seen_at = excluded.seen_at, leaf = excluded.leaf
                  RETURNING id",
-                params![host, dir_url, now],
+                params![host, dir_url, now, leaf],
                 |row| row.get(0),
             )?;
             delete_dir_entries(conn, id)?;
@@ -490,19 +534,32 @@ fn purge_host(conn: &Connection, host: &str) -> Result<usize> {
     Ok(files)
 }
 
-/// What a site holds, counted over its stored files. With `leaf_only`, only
-/// files in folders that have no sub-folders count: that is all an unfinished
-/// crawl can judge, since the top of an archive is README and index files and
-/// the downloads are further down.
-fn host_counts(conn: &Connection, host: &str, leaf_only: bool) -> Result<Counts> {
+/// What a site holds, counted over its stored files, for the quality verdict.
+///
+/// A site that is still being crawled (`paused`) has only shown its top so far:
+/// a big archive's first folders hold README and index files, and the downloads
+/// are further down. So only leaf folders count, and nothing counts while a
+/// folder still waiting is deeper than the deepest leaf seen, because what is
+/// left to crawl could change the verdict. Any other site counts every file.
+fn host_counts(conn: &Connection, host: &str, paused: bool) -> Result<Counts> {
+    if paused {
+        let deepest = |sql: &str| -> Result<Option<i64>> {
+            Ok(conn.query_row(sql, [host], |row| row.get(0))?)
+        };
+        let leaf = deepest("SELECT max(url_depth(url)) FROM dirs WHERE host = ?1 AND leaf = 1")?;
+        let waiting = deepest("SELECT max(url_depth(url)) FROM candidates WHERE host = ?1")?;
+        match (leaf, waiting) {
+            (None, _) => return Ok(Counts::default()),
+            (Some(leaf), Some(waiting)) if waiting > leaf => return Ok(Counts::default()),
+            _ => {}
+        }
+    }
     let counts = conn.query_row(
         "SELECT count(e.id), coalesce(sum(e.size >= ?2), 0),
                 coalesce(sum(is_useful(e.name, e.size)), 0)
          FROM dirs d JOIN entries e ON e.dir_id = d.id AND e.is_dir = 0
-         WHERE d.host = ?1
-           AND (?3 = 0 OR NOT EXISTS (
-                SELECT 1 FROM entries s WHERE s.dir_id = d.id AND s.is_dir = 1))",
-        params![host, quality::BIG_FILE as i64, leaf_only],
+         WHERE d.host = ?1 AND (?3 = 0 OR d.leaf = 1)",
+        params![host, quality::BIG_FILE as i64, paused],
         |row| {
             Ok(Counts {
                 files: row.get::<_, i64>(0)? as u64,
@@ -512,6 +569,16 @@ fn host_counts(conn: &Connection, host: &str, leaf_only: bool) -> Result<Counts>
         },
     )?;
     Ok(counts)
+}
+
+/// True if the site has a waiting URL that you added, or that a site you added
+/// moved to.
+fn has_trust_marker(conn: &Connection, host: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM candidates WHERE host = ?1 AND source IN ('seed', 'moved'))",
+        [host],
+        |row| row.get(0),
+    )?)
 }
 
 /// Deletes everything stored for a site and keeps only its status and the
@@ -541,24 +608,27 @@ pub fn add_candidates(conn: &Connection, urls: &[Url], source: &str) -> Result<(
     insert_candidates(conn, urls, source, unix_now())
 }
 
-/// Marks sites you named on the command line as trusted, so the quality check
-/// never judges them.
-pub fn trust_hosts(conn: &Connection, urls: &[Url]) -> Result<()> {
-    let hosts: HashSet<String> = urls.iter().filter_map(filters::canonical_host_of).collect();
-    for host in hosts {
-        conn.execute("UPDATE hosts SET trusted = 1 WHERE host = ?1", [host])?;
-    }
-    Ok(())
-}
-
 /// `candidates.source` for sites you added yourself.
 pub const SEED_SOURCE: &str = "seed";
+
+/// `candidates.source` for the new address of a site you added that has moved. It
+/// is trusted like a seed, but a crawl started from it cannot pass trust on again,
+/// so trust never travels further than one hop.
+pub const MOVED_SOURCE: &str = "moved";
 
 /// Adds sites you chose. They are trusted, and earlier verdicts that a retry or
 /// a fix may change (not a listing, unreachable, given up, low value, and
 /// sensitive, since those rules have changed before) are forgotten so they are
 /// tried again. Returns how many sites were retried.
 pub fn add_seeds(conn: &Connection, urls: &[Url]) -> Result<usize> {
+    add_trusted(conn, urls, SEED_SOURCE)
+}
+
+/// Adds sites as trusted, recorded under `source`: `SEED_SOURCE` for sites you
+/// chose, `MOVED_SOURCE` for the new address of one that moved. A site already
+/// known is trusted too, and one that is waiting as a link or a Common Crawl
+/// find becomes yours.
+fn add_trusted(conn: &Connection, urls: &[Url], source: &str) -> Result<usize> {
     let hosts: HashSet<String> = urls.iter().filter_map(filters::canonical_host_of).collect();
     let mut retried = 0;
     for host in &hosts {
@@ -569,8 +639,61 @@ pub fn add_seeds(conn: &Connection, urls: &[Url]) -> Result<usize> {
         )?;
         conn.execute("UPDATE hosts SET trusted = 1 WHERE host = ?1", [host])?;
     }
-    insert_candidates(conn, urls, SEED_SOURCE, unix_now())?;
+    insert_candidates(conn, urls, source, unix_now())?;
     Ok(retried)
+}
+
+/// The sites you named on the command line, ready to crawl: recorded as seeds
+/// (so they are trusted, and stay so even if the crawl is killed before it
+/// records anything), together with the folders each has waiting from earlier
+/// runs, which finishing the crawl would otherwise discard. Only the URLs you
+/// gave, and waiting ones that were seeds, count as seeds.
+pub fn named_sites(conn: &Connection, urls: &[Url]) -> Result<Vec<PendingHost>> {
+    let urls: Vec<Url> = urls.iter().map(filters::canonical_url).collect();
+    add_seeds(conn, &urls)?;
+    let mut sites: Vec<PendingHost> = Vec::new();
+    let mut listed: HashSet<String> = HashSet::new();
+    for url in urls {
+        let Some(host) = filters::canonical_host_of(&url) else {
+            continue;
+        };
+        let at = match sites.iter().position(|site| site.host == host) {
+            Some(at) => at,
+            None => {
+                sites.push(PendingHost {
+                    known: host_known(conn, &host)?,
+                    host,
+                    urls: Vec::new(),
+                    seeds: Vec::new(),
+                    trusted: true,
+                });
+                sites.len() - 1
+            }
+        };
+        if listed.insert(url.to_string()) {
+            sites[at].urls.push(url.clone());
+            sites[at].seeds.push(url);
+        }
+    }
+    for site in &mut sites {
+        for (url, is_seed) in waiting_urls(conn, &site.host)? {
+            if listed.insert(url.to_string()) {
+                site.urls.push(url.clone());
+            }
+            if is_seed && !site.seeds.contains(&url) {
+                site.seeds.push(url);
+            }
+        }
+    }
+    Ok(sites)
+}
+
+fn host_known(conn: &Connection, host: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM hosts WHERE host = ?1)",
+        [host],
+        |row| row.get(0),
+    )?)
 }
 
 fn insert_candidates(conn: &Connection, urls: &[Url], source: &str, now: i64) -> Result<()> {
@@ -582,33 +705,44 @@ fn insert_candidates(conn: &Connection, urls: &[Url], source: &str, now: i64) ->
          WHERE NOT EXISTS (
              SELECT 1 FROM hosts WHERE host = ?2 AND (?3 != 'resume' OR status != 'paused'))",
     )?;
-    for url in urls {
+    // One spelling per folder: `example.com.` and `example.com` are one site.
+    let urls: Vec<Url> = urls.iter().map(filters::canonical_url).collect();
+    for url in &urls {
         if let Some(host) = filters::canonical_host_of(url) {
             stmt.execute(params![url.as_str(), host, source, now])?;
         }
     }
-    if source == SEED_SOURCE {
+    if source == SEED_SOURCE || source == MOVED_SOURCE {
         // `INSERT OR IGNORE` keeps an older row for the same URL (a link or a
         // Common Crawl find), which would leave the site looking like one you did
-        // not add. A saved folder to continue from keeps its own source.
+        // not add. A saved folder to continue from keeps its own source, a seed
+        // is never demoted, and a moved address is only ever a step above a find.
         let mut promote = conn.prepare_cached(
-            "UPDATE candidates SET source = ?2 WHERE url = ?1 AND source NOT IN (?2, ?3)",
+            "UPDATE candidates SET source = ?2
+             WHERE url = ?1 AND source NOT IN ('seed', 'resume')
+               AND NOT (?2 = 'moved' AND source = 'moved')",
         )?;
-        for url in urls {
-            promote.execute(params![url.as_str(), SEED_SOURCE, RESUME_SOURCE])?;
+        for url in &urls {
+            promote.execute(params![url.as_str(), source])?;
         }
     }
     Ok(())
 }
 
-/// The URLs waiting for a site, shortest first.
-pub fn candidate_urls(conn: &Connection, host: &str) -> Result<Vec<Url>> {
-    let mut stmt = conn
-        .prepare_cached("SELECT url FROM candidates WHERE host = ?1 ORDER BY length(url), url")?;
-    let urls = stmt
-        .query_map([host], |row| row.get::<_, String>(0))?
+/// The URLs waiting for a site, shortest first, and whether you added each one.
+fn waiting_urls(conn: &Connection, host: &str) -> Result<Vec<(Url, bool)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT url, source = 'seed' FROM candidates WHERE host = ?1 ORDER BY length(url), url",
+    )?;
+    let rows = stmt
+        .query_map([host], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(urls.iter().filter_map(|u| Url::parse(u).ok()).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|(url, is_seed)| Some((Url::parse(&url).ok()?, is_seed)))
+        .collect())
 }
 
 /// A site with work waiting.
@@ -619,7 +753,10 @@ pub struct PendingHost {
     /// often a homepage rather than a listing, so `/pub/` must stay a seed. The
     /// crawler never fetches a URL twice.
     pub urls: Vec<Url>,
-    /// You added it (a seed), now or in an earlier run.
+    /// The URLs among `urls` that you added yourself. Only these, being the
+    /// addresses you chose, pass trust on if they turn out to have moved.
+    pub seeds: Vec<Url>,
+    /// You added it (a seed, or the new address of one), now or in an earlier run.
     pub trusted: bool,
     /// It was crawled before (paused), so this is not its first run.
     pub known: bool,
@@ -634,14 +771,16 @@ pub fn pending_hosts(
     exclude: &HashSet<String>,
 ) -> Result<Vec<PendingHost>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT c.host, c.url,
-                EXISTS (SELECT 1 FROM candidates s WHERE s.host = c.host AND s.source = 'seed')
+        "SELECT c.host, c.url, c.source = 'seed',
+                EXISTS (SELECT 1 FROM candidates s
+                        WHERE s.host = c.host AND s.source IN ('seed', 'moved'))
                     OR coalesce((SELECT h.trusted FROM hosts h WHERE h.host = c.host), 0),
                 EXISTS (SELECT 1 FROM hosts h WHERE h.host = c.host)
          FROM candidates c
          JOIN (SELECT c2.host AS host,
-                      min(CASE c2.source WHEN 'seed' THEN 0 WHEN 'resume' THEN 1
-                                         WHEN 'link' THEN 2 ELSE 3 END) AS prio,
+                      min(CASE c2.source WHEN 'seed' THEN 0 WHEN 'moved' THEN 0
+                                         WHEN 'resume' THEN 1 WHEN 'link' THEN 2
+                                         ELSE 3 END) AS prio,
                       min(c2.found_at) AS found
                FROM candidates c2
                WHERE NOT EXISTS (
@@ -652,14 +791,20 @@ pub fn pending_hosts(
          ORDER BY r.prio, r.found, c.host, length(c.url), c.url",
     )?;
     let limit = (want + exclude.len()) as i64;
-    let rows: Vec<(String, String, bool, bool)> = stmt
+    let rows: Vec<(String, String, bool, bool, bool)> = stmt
         .query_map([limit], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })?
         .collect::<rusqlite::Result<_>>()?;
 
     let mut hosts: Vec<PendingHost> = Vec::new();
-    for (host, raw, trusted, known) in rows {
+    for (host, raw, is_seed, trusted, known) in rows {
         if exclude.contains(&host) {
             continue;
         }
@@ -670,11 +815,15 @@ pub fn pending_hosts(
             hosts.push(PendingHost {
                 host,
                 urls: Vec::new(),
+                seeds: Vec::new(),
                 trusted,
                 known,
             });
         }
         if let (Ok(url), Some(last)) = (Url::parse(&raw), hosts.last_mut()) {
+            if is_seed {
+                last.seeds.push(url.clone());
+            }
             last.urls.push(url);
         }
     }
@@ -820,7 +969,7 @@ fn apply_sensitive(conn: &Connection) -> Result<(Vec<(String, String)>, usize)> 
         "SELECT d.host, d.url, e.id, e.name, sensitivity(e.name),
                 coalesce(h.trusted, 0)
                     OR EXISTS (SELECT 1 FROM candidates c
-                               WHERE c.host = d.host AND c.source = 'seed'),
+                               WHERE c.host = d.host AND c.source IN ('seed', 'moved')),
                 CASE WHEN e.is_dir THEN d.url || coalesce(e.href, e.name) || '/' END
          FROM entries e JOIN dirs d ON d.id = e.dir_id
          LEFT JOIN hosts h ON h.host = d.host
@@ -879,56 +1028,55 @@ fn apply_sensitive(conn: &Connection) -> Result<(Vec<(String, String)>, usize)> 
     Ok((dropped, omitted))
 }
 
-/// Deletes the listings stored for a folder and for everything below it.
+/// Deletes the listings stored for a folder and for everything below it, and the
+/// folders below it that are still waiting to be crawled. `folder_url` ends with
+/// `/`; the URLs below it are exactly those from `folder_url` up to the same text
+/// with the `/` replaced by the next character, so the unique URL indexes serve
+/// the lookups.
 fn delete_below(conn: &Connection, folder_url: &str) -> Result<()> {
-    const BELOW: &str = "substr(url, 1, length(?1)) = ?1";
+    let Some(stem) = folder_url.strip_suffix('/') else {
+        return Ok(());
+    };
+    let upper = format!("{stem}0");
+    let range = params![folder_url, upper];
     conn.execute(
-        &format!(
-            "DELETE FROM entries_fts WHERE rowid IN (
-                 SELECT id FROM entries WHERE dir_id IN (SELECT id FROM dirs WHERE {BELOW}))"
-        ),
-        [folder_url],
+        "DELETE FROM entries_fts WHERE rowid IN (
+             SELECT e.id FROM dirs d JOIN entries e ON e.dir_id = d.id
+             WHERE d.url >= ?1 AND d.url < ?2)",
+        range,
     )?;
     conn.execute(
-        &format!("DELETE FROM entries WHERE dir_id IN (SELECT id FROM dirs WHERE {BELOW})"),
-        [folder_url],
+        "DELETE FROM entries WHERE dir_id IN (
+             SELECT id FROM dirs WHERE url >= ?1 AND url < ?2)",
+        range,
     )?;
-    conn.execute(&format!("DELETE FROM dirs WHERE {BELOW}"), [folder_url])?;
+    conn.execute("DELETE FROM dirs WHERE url >= ?1 AND url < ?2", range)?;
+    conn.execute("DELETE FROM candidates WHERE url >= ?1 AND url < ?2", range)?;
     Ok(())
 }
 
-/// Drops sites you did not add that hold too little to keep.
+/// Drops sites you did not add that hold too little to keep. Each site is judged
+/// by the same function the writer uses when a crawl ends, so the two agree.
 fn apply_quality(conn: &Connection, thresholds: Thresholds) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT h.host, h.status, count(e.id), coalesce(sum(e.size >= ?1), 0),
-                coalesce(sum(is_useful(e.name, e.size)), 0)
-         FROM hosts h
-         LEFT JOIN dirs d ON d.host = h.host
-         LEFT JOIN entries e ON e.dir_id = d.id AND e.is_dir = 0
-              AND (h.status = 'done'
-                   OR NOT EXISTS (SELECT 1 FROM entries s WHERE s.dir_id = d.id AND s.is_dir = 1))
-         WHERE h.trusted = 0 AND h.status IN ('done', 'paused', 'partial')
-         GROUP BY h.host
-         ORDER BY h.host",
+        "SELECT host, status FROM hosts
+         WHERE trusted = 0
+           AND status IN ('done', 'paused', 'partial', 'unreachable', 'not_listing')
+           AND NOT EXISTS (SELECT 1 FROM candidates c
+                           WHERE c.host = hosts.host AND c.source IN ('seed', 'moved'))
+         ORDER BY host",
     )?;
-    let rows = stmt
-        .query_map([quality::BIG_FILE as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)? == HostStatus::Done.as_str(),
-                Counts {
-                    files: row.get::<_, i64>(2)? as u64,
-                    big: row.get::<_, i64>(3)? as u64,
-                    useful: row.get::<_, i64>(4)? as u64,
-                },
-            ))
+    let sites = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
     let mut dropped = Vec::new();
-    for (host, finished, counts) in rows {
-        if let Some(reason) = thresholds.judge(&counts, finished) {
+    for (host, status) in sites {
+        let counts = host_counts(conn, &host, status == HostStatus::Paused.as_str())?;
+        if let Some(reason) = thresholds.judge(&counts, status == HostStatus::Done.as_str()) {
             mark_host(conn, &host, HostStatus::LowValue, &reason)?;
             dropped.push((host, reason));
         }
@@ -1277,6 +1425,7 @@ mod tests {
         let msg = Msg::Entries {
             host: "h.example".into(),
             entries,
+            leaf: false,
         };
         apply(&conn, &msg).unwrap();
 
@@ -1296,6 +1445,7 @@ mod tests {
         let msg = Msg::Entries {
             host: "h.example".into(),
             entries: vec![entry(urls[1], false, Some(149_213_137))],
+            leaf: true,
         };
         apply(&conn, &msg).unwrap();
         assert_eq!(files(&conn), vec![urls[1].to_string()]);
@@ -1333,6 +1483,7 @@ mod tests {
             let msg = Msg::Entries {
                 host: "mirror.example.org".into(),
                 entries,
+                leaf: true,
             };
             apply(&conn, &msg).unwrap();
         }
@@ -1364,6 +1515,7 @@ mod tests {
         let msg = Msg::Entries {
             host: host.into(),
             entries,
+            leaf: true,
         };
         apply(conn, &msg).unwrap();
         let done = Msg::HostDone {
@@ -1560,6 +1712,7 @@ mod tests {
         let msg = Msg::Entries {
             host: "early.example".into(),
             entries: vec![entry("https://early.example/d/a.jpg", false, Some(9_000))],
+            leaf: true,
         };
         apply(&conn, &msg).unwrap();
         let paused = Msg::HostDone {
@@ -1597,6 +1750,7 @@ mod tests {
             ("b.example", "low_value"),
             ("c.example", "robots_disallowed"),
             ("d.example", "done"),
+            ("e.example", "sensitive"),
         ] {
             conn.execute(
                 "INSERT INTO hosts (host, status, crawled_at) VALUES (?1, ?2, 0)",
@@ -1609,16 +1763,23 @@ mod tests {
             url("https://b.example/pub/"),
             url("https://c.example/pub/"),
             url("https://d.example/pub/"),
+            url("https://e.example/pub/"),
             url("https://new.example/pub/"),
         ];
         let retried = add_seeds(&conn, &seeds).unwrap();
-        assert_eq!(retried, 2, "not_listing and low_value are tried again");
+        assert_eq!(
+            retried, 3,
+            "not_listing, low_value and sensitive are tried again"
+        );
         let waiting: Vec<String> = pending_hosts(&conn, 10, &HashSet::new())
             .unwrap()
             .into_iter()
             .map(|h| h.host)
             .collect();
-        assert_eq!(waiting, vec!["a.example", "b.example", "new.example"]);
+        assert_eq!(
+            waiting,
+            vec!["a.example", "b.example", "e.example", "new.example"]
+        );
         // Robots.txt verdicts are respected, and finished sites stay finished, but trusted.
         assert_eq!(status(&conn, "c.example"), "robots_disallowed");
         let trusted: i64 = conn
@@ -1812,9 +1973,11 @@ mod tests {
                 )
             })
             .collect();
+        let leaf = !items.iter().any(|(name, _)| name.ends_with('/'));
         let msg = Msg::Entries {
             host: host.into(),
             entries,
+            leaf,
         };
         apply(conn, &msg).unwrap();
     }
@@ -1900,6 +2063,14 @@ mod tests {
         );
         host_done(&conn, "archive.example", HostStatus::Done, false, t);
         assert_eq!(status(&conn, "archive.example"), "done");
+
+        // Leaf folders count, the top folder's files do not: 10 files in a leaf and
+        // 120 README files above it are 10 files of evidence, not 130.
+        let few_leaf = photos(10);
+        put(&conn, "top-heavy.example", "pub", &borrowed(&top));
+        put(&conn, "top-heavy.example", "pub/iso", &borrowed(&few_leaf));
+        host_done(&conn, "top-heavy.example", HostStatus::Paused, false, t);
+        assert_eq!(status(&conn, "top-heavy.example"), "paused");
 
         // A finished site is judged on everything, including its top folder.
         put(&conn, "shallow.example", "pub", &borrowed(&top));
@@ -2256,7 +2427,7 @@ mod tests {
                     _ => {
                         // `crawl URL` by hand: trusted, never judged.
                         put(&conn, host, "pub", &[("a.jpg", Some(10))]);
-                        trust_hosts(&conn, std::slice::from_ref(&target)).unwrap();
+                        named_sites(&conn, std::slice::from_ref(&target)).unwrap();
                         host_done(&conn, host, HostStatus::Done, true, None);
                         if !seeded.contains(&host) {
                             seeded.push(host);
@@ -2275,6 +2446,552 @@ mod tests {
                         "{site} became {now} in round {round}:\n  {}",
                         log.join("\n  ")
                     );
+                }
+            }
+        }
+    }
+
+    // -- Regression tests for the fourth independent review ----------------
+
+    #[test]
+    fn a_site_that_gave_up_or_vanished_is_dropped_when_plainly_junk() {
+        let conn = open(&temp_path("terminal")).unwrap();
+        let t = Some(Thresholds::default());
+        let junk = photos(150);
+        // A folder that also has a sub-folder: for a site that will not be crawled
+        // again every file counts, whatever folder it is in.
+        let mut items = borrowed(&junk);
+        items.push(("sub/", None));
+        for (host, end) in [
+            ("gave-up.example", HostStatus::Partial),
+            ("vanished.example", HostStatus::Unreachable),
+            ("gone.example", HostStatus::NotListing),
+        ] {
+            put(&conn, host, "pub", &items);
+            host_done(&conn, host, end, false, t);
+            assert_eq!(status(&conn, host), "low_value", "{host}");
+        }
+        // Too few files to say, or something big among them: it stays.
+        let few = photos(60);
+        put(&conn, "few.example", "pub", &borrowed(&few));
+        host_done(&conn, "few.example", HostStatus::Partial, false, t);
+        assert_eq!(status(&conn, "few.example"), "partial");
+        let mut with_image = borrowed(&junk);
+        with_image.push(("a.iso", Some(4_000_000_000)));
+        put(&conn, "big.example", "pub", &with_image);
+        host_done(&conn, "big.example", HostStatus::Partial, false, t);
+        assert_eq!(status(&conn, "big.example"), "partial");
+        // A site you added is never judged, however it ended.
+        put(&conn, "mine.example", "pub", &items);
+        host_done(&conn, "mine.example", HostStatus::Partial, true, None);
+        assert_eq!(status(&conn, "mine.example"), "partial");
+    }
+
+    #[test]
+    fn clean_judges_a_site_that_vanished_after_a_pause() {
+        let mut conn = open(&temp_path("vanished")).unwrap();
+        let junk = photos(150);
+        put(&conn, "v.example", "pub", &borrowed(&junk));
+        // Paused with a folder still waiting deeper than the leaf: not judged.
+        let frontier = vec![url("https://v.example/pub/a/b/")];
+        apply(
+            &conn,
+            &Msg::Paused {
+                host: "v.example".into(),
+                finished: vec![],
+                frontier,
+            },
+        )
+        .unwrap();
+        host_done(&conn, "v.example", HostStatus::Paused, false, None);
+        assert!(clean(&mut conn, &default_rules()).unwrap().is_empty());
+        // The next run found the site gone. Nothing will crawl it again.
+        host_done(&conn, "v.example", HostStatus::Unreachable, false, None);
+        let report = clean(&mut conn, &default_rules()).unwrap();
+        assert_eq!(report.low_value.len(), 1, "{report:?}");
+        assert_eq!(status(&conn, "v.example"), "low_value");
+    }
+
+    #[test]
+    fn a_paused_site_waits_for_the_crawl_to_reach_its_deepest_folders() {
+        let conn = open(&temp_path("deep-frontier")).unwrap();
+        let t = Some(Thresholds::default());
+        let junk = photos(150);
+        let junk = borrowed(&junk);
+        let pause = |host: &str, waiting: &str| {
+            let msg = Msg::Paused {
+                host: host.into(),
+                finished: vec![],
+                frontier: vec![url(waiting)],
+            };
+            apply(&conn, &msg).unwrap();
+            host_done(&conn, host, HostStatus::Paused, false, t);
+        };
+        // 150 junk files in a leaf one level down, but a folder three levels down
+        // is still waiting: what is left to crawl could change the verdict.
+        put(&conn, "deep.example", "pub", &junk);
+        pause("deep.example", "https://deep.example/pub/a/b/c/");
+        assert_eq!(status(&conn, "deep.example"), "paused");
+        // Nothing waiting is deeper than the leaf: plainly junk, so dropped.
+        put(&conn, "flat.example", "pub", &junk);
+        pause("flat.example", "https://flat.example/other/");
+        assert_eq!(status(&conn, "flat.example"), "low_value");
+    }
+
+    #[test]
+    fn clean_of_a_paused_site_with_a_big_folder_is_not_quadratic() {
+        let mut conn = open(&temp_path("big-folder")).unwrap();
+        let many: Vec<(String, Option<u64>)> = (0..20_000)
+            .map(|i| (format!("f{i}.jpg"), Some(40_000)))
+            .collect();
+        put(&conn, "big.example", "pub", &borrowed(&many));
+        let paused = Msg::Paused {
+            host: "big.example".into(),
+            finished: vec![],
+            frontier: vec![url("https://big.example/x/")],
+        };
+        apply(&conn, &paused).unwrap();
+        host_done(&conn, "big.example", HostStatus::Paused, false, None);
+
+        let started = std::time::Instant::now();
+        let report = clean(&mut conn, &default_rules()).unwrap();
+        let took = started.elapsed();
+
+        assert_eq!(report.low_value.len(), 1, "{report:?}");
+        // Linear in the files: milliseconds. It once compared every file with all
+        // the files of its folder, which took a minute for this many.
+        assert!(took < Duration::from_secs(5), "clean took {took:?}");
+    }
+
+    #[test]
+    fn upgrades_a_database_without_the_leaf_flag() {
+        let path = temp_path("no-leaf");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE dirs (id INTEGER PRIMARY KEY, host TEXT NOT NULL,
+                     url TEXT NOT NULL UNIQUE, seen_at INTEGER NOT NULL);
+                 CREATE TABLE entries (id INTEGER PRIMARY KEY, dir_id INTEGER NOT NULL,
+                     name TEXT NOT NULL, href TEXT, is_dir INTEGER NOT NULL, size INTEGER,
+                     mtime TEXT);
+                 INSERT INTO dirs VALUES (1, 'old.example', 'https://old.example/pub/', 0);
+                 INSERT INTO dirs VALUES (2, 'old.example', 'https://old.example/pub/iso/', 0);
+                 INSERT INTO entries (dir_id, name, is_dir, size)
+                     VALUES (1, 'iso', 1, NULL), (1, 'README', 0, 10), (2, 'a.iso', 0, 4000000000);",
+            )
+            .unwrap();
+        let conn = open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT url, leaf FROM dirs ORDER BY url")
+            .unwrap();
+        let leaves: Vec<(String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        // The folder with a sub-folder is not a leaf; the one below it is.
+        assert_eq!(
+            leaves,
+            vec![
+                ("https://old.example/pub/".to_string(), 0),
+                ("https://old.example/pub/iso/".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn named_sites_are_seeds_and_continue_the_folders_they_have_waiting() {
+        let conn = open(&temp_path("named")).unwrap();
+        add_candidates(
+            &conn,
+            &[
+                url("https://a.example/pub/iso/"),
+                url("https://a.example/pub/doc/"),
+                url("https://other.example/x/"),
+            ],
+            "link",
+        )
+        .unwrap();
+        add_seeds(&conn, &[url("https://a.example/pub/old-seed/")]).unwrap();
+
+        let sites = named_sites(
+            &conn,
+            &[
+                url("https://A.example./pub/iso/"),
+                url("https://b.example/"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(sites.len(), 2);
+        let a = &sites[0];
+        assert_eq!(a.host, "a.example");
+        assert!(a.trusted);
+        // What you typed comes first, then what was waiting, each URL once. Only
+        // the URLs you added count as seeds, not the folder found through a link.
+        assert_eq!(
+            a.urls,
+            vec![
+                url("https://a.example/pub/iso/"),
+                url("https://a.example/pub/doc/"),
+                url("https://a.example/pub/old-seed/"),
+            ]
+        );
+        assert_eq!(
+            a.seeds,
+            vec![
+                url("https://a.example/pub/iso/"),
+                url("https://a.example/pub/old-seed/"),
+            ]
+        );
+        assert_eq!(sites[1].urls, vec![url("https://b.example/")]);
+        assert_eq!(sites[1].seeds, sites[1].urls);
+        // Other sites are left alone.
+        assert!(sites.iter().all(|s| s.host != "other.example"));
+    }
+
+    #[test]
+    fn a_named_site_keeps_its_trust_when_its_crawl_was_killed() {
+        let mut conn = open(&temp_path("killed")).unwrap();
+        let big = Some(4_000_000_000);
+        // The crawl stored a listing and was killed before it wrote the site's row.
+        put(
+            &conn,
+            "mine.example",
+            "pub",
+            &[("a.iso", big), ("backup-2026-01-01.zip", Some(9))],
+        );
+        assert!(!has_row(&conn, "mine.example"));
+
+        named_sites(&conn, &[url("https://mine.example/pub/")]).unwrap();
+        let report = clean(&mut conn, &default_rules()).unwrap();
+
+        // It costs the site you named only the weak-named file.
+        assert!(report.sensitive.is_empty(), "{report:?}");
+        assert_eq!(report.omitted_entries, 1);
+        assert_eq!(files(&conn), vec!["https://mine.example/pub/a.iso"]);
+    }
+
+    #[test]
+    fn the_new_address_of_a_moved_seed_is_trusted_but_cannot_pass_trust_on() {
+        let mut conn = open(&temp_path("moved-addr")).unwrap();
+        let moved = |host: &str| Msg::Candidates {
+            urls: vec![url(&format!("https://{host}/pub/"))],
+            source: MOVED_SOURCE.into(),
+        };
+        // A new address: waiting, trusted, and not a seed, so a crawl started from
+        // it cannot make yet another address trusted.
+        apply(&conn, &moved("new.example")).unwrap();
+        let waiting = pending_hosts(&conn, 10, &HashSet::new()).unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert!(waiting[0].trusted);
+        assert!(waiting[0].seeds.is_empty());
+
+        // An address already known and kept, though nobody vouched for it: trusted
+        // from now on, so the cleanup keeps it.
+        add_site(
+            &conn,
+            "known.example",
+            "pub",
+            &[("a.txt", Some(5))],
+            false,
+            None,
+        );
+        apply(&conn, &moved("known.example")).unwrap();
+        assert!(
+            clean(&mut conn, &default_rules())
+                .unwrap()
+                .low_value
+                .is_empty()
+        );
+        assert_eq!(status(&conn, "known.example"), "done");
+
+        // One dropped for holding little is tried again, as yours.
+        let t = Some(Thresholds::default());
+        add_site(
+            &conn,
+            "dropped.example",
+            "pub",
+            &[("a.txt", Some(5))],
+            false,
+            t,
+        );
+        assert_eq!(status(&conn, "dropped.example"), "low_value");
+        apply(&conn, &moved("dropped.example")).unwrap();
+        assert!(!has_row(&conn, "dropped.example"));
+        let waiting = pending_hosts(&conn, 10, &HashSet::new()).unwrap();
+        assert!(
+            waiting
+                .iter()
+                .any(|h| h.host == "dropped.example" && h.trusted)
+        );
+
+        // The crawl of an address that was found by a link and is still running
+        // when it turns out to be a seed's new address ends as yours, not judged.
+        apply(&conn, &moved("racy.example")).unwrap();
+        let tiny = photos(3);
+        put(&conn, "racy.example", "pub", &borrowed(&tiny));
+        host_done(&conn, "racy.example", HostStatus::Done, false, t);
+        assert_eq!(status(&conn, "racy.example"), "done");
+
+        // A seed you add for the same address later is a seed.
+        add_seeds(&conn, &[url("https://new.example/pub/")]).unwrap();
+        let waiting = pending_hosts(&conn, 10, &HashSet::new()).unwrap();
+        let new = waiting.iter().find(|h| h.host == "new.example").unwrap();
+        assert_eq!(new.seeds, vec![url("https://new.example/pub/")]);
+    }
+
+    #[test]
+    fn an_omitted_folder_takes_everything_below_it_including_waiting_folders() {
+        let mut conn = open(&temp_path("omit-below")).unwrap();
+        let big = Some(4_000_000_000);
+        // Folder names that need percent-encoding, and one that does not.
+        put(
+            &conn,
+            "mine.example",
+            "d",
+            &[
+                ("a.iso", big),
+                ("backup-2020-%C3%A9/", None),
+                ("bak-2019%20old/", None),
+                ("other/", None),
+            ],
+        );
+        put(
+            &conn,
+            "mine.example",
+            "d/backup-2020-%C3%A9",
+            &[("zzone.txt", Some(5)), ("deeper/", None)],
+        );
+        put(
+            &conn,
+            "mine.example",
+            "d/backup-2020-%C3%A9/deeper",
+            &[("zztwo.txt", Some(5))],
+        );
+        put(
+            &conn,
+            "mine.example",
+            "d/bak-2019%20old",
+            &[("zzthree.txt", Some(5))],
+        );
+        put(&conn, "mine.example", "d/other", &[("zzkeep.txt", Some(5))]);
+        // The crawl was paused with folders below the omitted one still to do.
+        let paused = Msg::Paused {
+            host: "mine.example".into(),
+            finished: vec![],
+            frontier: vec![
+                url("https://mine.example/d/backup-2020-%C3%A9/deeper/more/"),
+                url("https://mine.example/d/other/later/"),
+            ],
+        };
+        apply(&conn, &paused).unwrap();
+        host_done(&conn, "mine.example", HostStatus::Paused, true, None);
+        assert_eq!(hits(&conn, "zzone"), 1);
+
+        let report = clean(&mut conn, &default_rules()).unwrap();
+
+        assert_eq!(report.omitted_entries, 2);
+        for gone in ["zzone", "zztwo", "zzthree"] {
+            assert_eq!(hits(&conn, gone), 0, "{gone} is still searchable");
+        }
+        assert_eq!(hits(&conn, "zzkeep"), 1);
+        // What was waiting below the omitted folder is not crawled again.
+        let waiting: Vec<String> = waiting_urls(&conn, "mine.example")
+            .unwrap()
+            .into_iter()
+            .map(|(u, _)| u.to_string())
+            .collect();
+        assert_eq!(waiting, vec!["https://mine.example/d/other/later/"]);
+    }
+
+    #[test]
+    fn adding_a_seed_tries_a_site_dropped_as_sensitive_again() {
+        let conn = open(&temp_path("seed-sensitive")).unwrap();
+        conn.execute(
+            "INSERT INTO hosts (host, status, crawled_at, reason)
+             VALUES ('s.example', 'sensitive', 0, 'found /pub/.env')",
+            [],
+        )
+        .unwrap();
+        let retried = add_seeds(&conn, &[url("https://s.example/pub/")]).unwrap();
+        assert_eq!(retried, 1);
+        assert!(!has_row(&conn, "s.example"));
+        let waiting = pending_hosts(&conn, 10, &HashSet::new()).unwrap();
+        assert!(waiting.iter().any(|h| h.host == "s.example" && h.trusted));
+    }
+
+    /// Random operations; invariants of the store after each one.
+    #[test]
+    fn random_operations_keep_the_store_consistent() {
+        for round in 0..300u64 {
+            let mut x = (round + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut rnd = move |n: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % n
+            };
+            let mut conn = open(Path::new(":memory:")).unwrap();
+            let hosts = ["a.example", "b.example", "c.example"];
+            let folders = ["pub", "pub/x", "pub/y"];
+            // Sites you added, or that one of yours moved to: the only trusted ones.
+            let mut yours: Vec<&str> = Vec::new();
+            let mut log: Vec<String> = Vec::new();
+            for _ in 0..60 {
+                let host = hosts[rnd(3) as usize];
+                let folder = folders[rnd(3) as usize];
+                let dropped = conn
+                    .query_row(
+                        "SELECT status IN ('low_value', 'sensitive', 'skipped', 'opted_out')
+                         FROM hosts WHERE host = ?1",
+                        [host],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false);
+                // A dropped site is not crawled again, unless you add it.
+                let op = if dropped { 6 + rnd(2) * 3 } else { rnd(10) };
+                match op {
+                    0 | 1 => {
+                        let mut items: Vec<(String, Option<u64>)> = Vec::new();
+                        for i in 0..rnd(5) {
+                            let name = match rnd(6) {
+                                0 => format!("backup-2020-{i}.zip"),
+                                1 => format!("backup-2021-{i}/"),
+                                2 => format!("sub{i}/"),
+                                3 => format!("file{i}.iso"),
+                                4 => format!("notes{i}.txt"),
+                                _ => format!("f{i}.jpg"),
+                            };
+                            let size = (!name.ends_with('/')).then(|| rnd(3) * 2_500_000_000 + 10);
+                            items.push((name, size));
+                        }
+                        put(&conn, host, folder, &borrowed(&items));
+                        log.push(format!("entries {host}/{folder} {items:?}"));
+                    }
+                    2 | 3 => {
+                        let end = [
+                            HostStatus::Done,
+                            HostStatus::Paused,
+                            HostStatus::Partial,
+                            HostStatus::NotListing,
+                            HostStatus::Unreachable,
+                        ][rnd(5) as usize];
+                        let trusted = yours.contains(&host);
+                        if end == HostStatus::Paused {
+                            let waiting =
+                                url(&format!("https://{host}/{}/", folders[rnd(3) as usize]));
+                            let msg = Msg::Paused {
+                                host: host.into(),
+                                finished: vec![],
+                                frontier: vec![waiting],
+                            };
+                            apply(&conn, &msg).unwrap();
+                        }
+                        let judge = (!trusted).then(Thresholds::default);
+                        host_done(&conn, host, end, trusted, judge);
+                        log.push(format!("host_done {host} {end:?} trusted={trusted}"));
+                    }
+                    4 => {
+                        let source = ["link", "commoncrawl:X"][rnd(2) as usize];
+                        let target = url(&format!("https://{host}/{folder}/"));
+                        add_candidates(&conn, &[target], source).unwrap();
+                        log.push(format!("candidate {host}/{folder} {source}"));
+                    }
+                    5 => {
+                        add_seeds(&conn, &[url(&format!("https://{host}/{folder}/"))]).unwrap();
+                        if !yours.contains(&host) {
+                            yours.push(host);
+                        }
+                        log.push(format!("seed {host}/{folder}"));
+                    }
+                    6 => {
+                        clean(&mut conn, &default_rules()).unwrap();
+                        let again = clean(&mut conn, &default_rules()).unwrap();
+                        assert!(
+                            again.is_empty(),
+                            "a second clean found more in round {round}: {again:?}\n  {}",
+                            log.join("\n  ")
+                        );
+                        log.push("clean".into());
+                    }
+                    7 => {
+                        // A crawl of a seed found that its address moved to another site.
+                        let target = hosts[rnd(3) as usize];
+                        if yours.contains(&host) && target != host {
+                            let msg = Msg::Candidates {
+                                urls: vec![url(&format!("https://{target}/pub/"))],
+                                source: MOVED_SOURCE.into(),
+                            };
+                            apply(&conn, &msg).unwrap();
+                            if !yours.contains(&target) {
+                                yours.push(target);
+                            }
+                            log.push(format!("moved {host} -> {target}"));
+                        }
+                    }
+                    _ => {}
+                }
+                let fts: i64 = conn
+                    .query_row("SELECT count(*) FROM entries_fts_docsize", [], |r| r.get(0))
+                    .unwrap();
+                let entries: i64 = conn
+                    .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(
+                    fts,
+                    entries,
+                    "search index out of step in round {round}:\n  {}",
+                    log.join("\n  ")
+                );
+                let orphans: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM entries WHERE dir_id NOT IN (SELECT id FROM dirs)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    orphans,
+                    0,
+                    "entries without a folder in round {round}:\n  {}",
+                    log.join("\n  ")
+                );
+                let stale: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM hosts h
+                         WHERE h.status IN ('low_value', 'sensitive', 'skipped', 'opted_out')
+                           AND (EXISTS (SELECT 1 FROM dirs d WHERE d.host = h.host)
+                                OR EXISTS (SELECT 1 FROM candidates c WHERE c.host = h.host))",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    stale,
+                    0,
+                    "a dropped site keeps data in round {round}:\n  {}",
+                    log.join("\n  ")
+                );
+                for h in hosts {
+                    let row = conn.query_row(
+                        "SELECT status, trusted FROM hosts WHERE host = ?1",
+                        [h],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                    );
+                    if let Ok((state, trusted)) = row {
+                        assert!(
+                            trusted == 0 || yours.contains(&h),
+                            "{h} is trusted but nobody added it (round {round}):\n  {}",
+                            log.join("\n  ")
+                        );
+                        // Weak names cost a site of yours the entry, never the site.
+                        assert!(
+                            !yours.contains(&h) || (state != "low_value" && state != "sensitive"),
+                            "{h} (yours) became {state} in round {round}:\n  {}",
+                            log.join("\n  ")
+                        );
+                    }
                 }
             }
         }

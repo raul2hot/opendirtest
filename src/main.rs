@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -545,27 +544,6 @@ fn print_clean_report(report: &CleanReport) {
     }
 }
 
-/// Adds the folders a site still has waiting in the database to the URLs you
-/// gave for it. Finishing its crawl clears them, so they would be lost, and a
-/// site paused earlier would be recorded as done.
-fn with_waiting_folders(conn: &rusqlite::Connection, mut seeds: Vec<Url>) -> Result<Vec<Url>> {
-    let hosts: HashSet<String> = seeds
-        .iter()
-        .filter_map(filters::canonical_host_of)
-        .collect();
-    let mut known: HashSet<String> = seeds.iter().map(Url::to_string).collect();
-    let mut hosts: Vec<String> = hosts.into_iter().collect();
-    hosts.sort();
-    for host in hosts {
-        for url in store::candidate_urls(conn, &host)? {
-            if known.insert(url.to_string()) {
-                seeds.push(url);
-            }
-        }
-    }
-    Ok(seeds)
-}
-
 async fn run_crawl(
     seeds: Vec<Url>,
     pending: Option<Pending>,
@@ -575,9 +553,9 @@ async fn run_crawl(
     progress_every: Duration,
 ) -> Result<()> {
     let mut conn = store::open(db)?;
-    // Sites you name now are trusted, so the cleanup below cannot judge them.
-    store::trust_hosts(&conn, &seeds)?;
-    let seeds = with_waiting_folders(&conn, seeds)?;
+    // Sites you name now are recorded as seeds: trusted, so the cleanup below
+    // cannot judge them, and crawled together with any folders they have waiting.
+    let named = store::named_sites(&conn, &seeds)?;
     clean_stored(&mut conn, &cfg)?;
     cfg.sensitive_hosts = store::sensitive_hosts(&conn)?.into_iter().collect();
     drop(conn);
@@ -589,7 +567,7 @@ async fn run_crawl(
         spawn_ticker(progress_every, move || progress_line(&stats, started))
     };
 
-    let result = crawler::crawl(seeds, pending, cfg, tx, stop, stats.clone()).await;
+    let result = crawler::crawl(named, pending, cfg, tx, stop, stats.clone()).await;
     progress.abort();
     writer
         .join()
@@ -852,38 +830,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::remove_file(&path);
         path
-    }
-
-    #[test]
-    fn an_explicit_crawl_continues_the_folders_a_site_has_waiting() {
-        let db = scratch("waiting.db");
-        let conn = store::open(&db).unwrap();
-        let url = |u: &str| Url::parse(u).unwrap();
-        store::add_candidates(
-            &conn,
-            &[
-                url("https://a.example/pub/iso/"),
-                url("https://a.example/pub/doc/"),
-                url("https://other.example/x/"),
-            ],
-            "link",
-        )
-        .unwrap();
-
-        // The site you name is crawled from its waiting folders too; finishing
-        // its crawl would otherwise clear them.
-        let merged = with_waiting_folders(&conn, vec![url("https://A.example./pub/iso/")]).unwrap();
-        assert_eq!(
-            merged,
-            vec![
-                url("https://a.example./pub/iso/"),
-                url("https://a.example/pub/doc/"),
-                url("https://a.example/pub/iso/"),
-            ]
-        );
-        // Other sites are left alone, and a site with nothing waiting is unchanged.
-        let plain = with_waiting_folders(&conn, vec![url("https://c.example/")]).unwrap();
-        assert_eq!(plain, vec![url("https://c.example/")]);
     }
 
     #[test]

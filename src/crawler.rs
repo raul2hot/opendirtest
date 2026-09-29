@@ -119,15 +119,15 @@ pub struct Pending {
     pub max_hosts: Option<usize>,
 }
 
-/// Crawls the seeds, grouped by host, and then, with `pending`, the hosts
-/// waiting in the database. The database is re-read as slots free up, so sites
-/// found during the run are crawled in the same run.
+/// Crawls the sites you named (`named`, from `store::named_sites`), and then,
+/// with `pending`, the hosts waiting in the database. The database is re-read as
+/// slots free up, so sites found during the run are crawled in the same run.
 ///
 /// Returns when nothing is left, or soon after `stop` is cancelled. Hosts that
 /// were running then are recorded as paused, with what is left of their crawl
 /// saved for the next run.
 pub async fn crawl(
-    seeds: Vec<Url>,
+    named: Vec<PendingHost>,
     pending: Option<Pending>,
     cfg: CrawlConfig,
     tx: mpsc::Sender<Msg>,
@@ -135,7 +135,7 @@ pub async fn crawl(
     stats: Arc<Stats>,
 ) -> Result<()> {
     let client = build_client()?;
-    let mut ready: VecDeque<PendingHost> = group_by_host(seeds).into();
+    let mut ready: VecDeque<PendingHost> = named.into();
     let source = match &pending {
         Some(p) => Some(store::open(&p.db)?),
         None => None,
@@ -182,6 +182,7 @@ pub async fn crawl(
                     host: site.host,
                     trusted: site.trusted,
                     first_run: !site.known,
+                    seed_urls: site.seeds.iter().map(Url::to_string).collect(),
                     client: client.clone(),
                     pacer: Pacer::new(cfg.per_host_delay),
                     cfg: cfg.clone(),
@@ -214,28 +215,6 @@ pub async fn crawl(
         report_panic(result);
     }
     Ok(())
-}
-
-/// Groups the seeds you gave by site. They are trusted: never judged.
-fn group_by_host(seeds: Vec<Url>) -> Vec<PendingHost> {
-    let mut hosts: Vec<PendingHost> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
-    for seed in seeds {
-        let Some(host) = filters::canonical_host_of(&seed) else {
-            continue;
-        };
-        let i = *index.entry(host.clone()).or_insert_with(|| {
-            hosts.push(PendingHost {
-                host,
-                urls: Vec::new(),
-                trusted: true,
-                known: false,
-            });
-            hosts.len() - 1
-        });
-        hosts[i].urls.push(seed);
-    }
-    hosts
 }
 
 /// Waits until the database writer has committed everything sent so far.
@@ -354,6 +333,9 @@ struct HostCrawl {
     trusted: bool,
     /// Its first run (not a continuation).
     first_run: bool,
+    /// The URLs you added yourself, as text. Only a crawl started from one of these
+    /// passes trust on when it turns out to have moved.
+    seed_urls: HashSet<String>,
     client: Client,
     cfg: Arc<CrawlConfig>,
     tx: mpsc::Sender<Msg>,
@@ -451,6 +433,8 @@ impl HostCrawl {
         // A new site you did not add is judged early, so junk does not hold a
         // crawl slot: after PROBE_DIRS folders, by what its files look like.
         let mut counts = Counts::default();
+        // How deep the leaf folders counted so far are.
+        let mut deepest_leaf = 0;
         let mut probed = false;
         let early_judge = (!self.trusted && self.first_run && self.cfg.quality.enabled())
             .then_some(self.cfg.quality);
@@ -462,7 +446,8 @@ impl HostCrawl {
                 queue.push_front((url, depth));
                 break;
             }
-            let page = match self.fetch_page(url.clone(), depth == 0).await {
+            let top = self.seed_urls.contains(url.as_str());
+            let page = match self.fetch_page(url.clone(), top).await {
                 Fetch::Page(page) => page,
                 Fetch::Skipped => {
                     errors_in_a_row = 0;
@@ -513,30 +498,6 @@ impl HostCrawl {
                 });
             }
 
-            // Only folders without sub-folders count: the top of a big archive is
-            // README and index files, and its downloads are further down.
-            if !listing.entries.iter().any(|e| e.is_dir) {
-                for e in &listing.entries {
-                    counts.add(&e.name, e.size);
-                }
-            }
-            if dirs >= quality::PROBE_DIRS
-                && !probed
-                && counts.files >= quality::MIN_EVIDENCE
-                && let Some(thresholds) = early_judge
-            {
-                probed = true; // one early verdict; the writer judges again at the end
-                if let Some(why) = thresholds.judge(&counts, false) {
-                    return Some(Report {
-                        status: HostStatus::LowValue,
-                        server,
-                        dirs,
-                        reason: Some(why),
-                        purge: true,
-                    });
-                }
-            }
-
             let Listing {
                 entries,
                 other_dirs,
@@ -547,27 +508,33 @@ impl HostCrawl {
                 self.save_candidates(external_dirs).await;
             }
 
+            // The sub-folders worth walking: not skipped, too deep, too long or
+            // looping. A leaf is a folder with none, so the crawl goes no further
+            // from it.
+            let mut next: Vec<Url> = entries
+                .iter()
+                .filter(|e| e.is_dir)
+                .map(|e| e.url.clone())
+                .collect();
+            if !FOLLOW_LISTED_LINKS_ONLY {
+                next.extend(other_dirs);
+            }
+            next.retain(|dir| {
+                depth < self.cfg.max_depth
+                    && dir.as_str().len() <= MAX_URL_LEN
+                    && !has_repeating_segments(dir.path())
+                    && !self.cfg.skip.skips_folder(dir)
+            });
+            let leaf = next.is_empty();
+
             // Content already seen on this host (a symlink loop or an alias such
             // as `latest -> 2.4.1`): keep the entries, but don't walk it again.
             if !is_duplicate(&entries, &mut listing_hashes) {
-                let mut next: Vec<Url> = entries
-                    .iter()
-                    .filter(|e| e.is_dir)
-                    .map(|e| e.url.clone())
-                    .collect();
-                if !FOLLOW_LISTED_LINKS_ONLY {
-                    next.extend(other_dirs);
-                }
                 // Past this run's budget, directories go to the database for the
                 // next run instead of into memory.
                 let mut overflow = Vec::new();
                 for dir in next {
-                    if depth < self.cfg.max_depth
-                        && dir.as_str().len() <= MAX_URL_LEN
-                        && !has_repeating_segments(dir.path())
-                        && !self.cfg.skip.skips_folder(&dir)
-                        && seen.insert(dir.to_string())
-                    {
+                    if seen.insert(dir.to_string()) {
                         if queue.len() as u64 + dirs < self.cfg.max_dirs_per_host {
                             queue.push_back((dir, depth + 1));
                         } else if overflow_saved < MAX_SAVED_OVERFLOW {
@@ -586,10 +553,41 @@ impl HostCrawl {
                 }
             }
 
+            // A new site you did not add is judged early, on what its leaf folders
+            // hold: the top of a big archive is README and index files, and its
+            // downloads are further down. So the verdict waits until the leaves
+            // seen are as deep as anything still queued.
+            if leaf {
+                for e in entries.iter().filter(|e| !e.is_dir) {
+                    counts.add(&e.name, e.size);
+                }
+                deepest_leaf = deepest_leaf.max(filters::path_depth(page_url.as_str()));
+            }
+            if dirs >= quality::PROBE_DIRS
+                && !probed
+                && counts.files >= quality::MIN_EVIDENCE
+                && let Some(thresholds) = early_judge
+                && queue
+                    .iter()
+                    .all(|(u, _)| filters::path_depth(u.as_str()) <= deepest_leaf)
+            {
+                probed = true; // one early verdict; the writer judges again at the end
+                if let Some(why) = thresholds.judge(&counts, false) {
+                    return Some(Report {
+                        status: HostStatus::LowValue,
+                        server,
+                        dirs,
+                        reason: Some(why),
+                        purge: true,
+                    });
+                }
+            }
+
             self.stats.entries.fetch_add(entries.len() as u64, Relaxed);
             let msg = Msg::Entries {
                 host: self.host.clone(),
                 entries,
+                leaf,
             };
             if self.tx.send(msg).await.is_err() {
                 // The database writer is gone, so nothing more can be saved.
@@ -663,7 +661,7 @@ impl HostCrawl {
 
     /// Fetches one directory page, following same-host redirects by hand so
     /// that every hop is checked against robots.txt and paced. `top` is true for
-    /// a URL the crawl started from (a seed, or a saved folder to continue from).
+    /// a URL you added yourself, which passes trust on if it has moved.
     async fn fetch_page(&mut self, start: Url, top: bool) -> Fetch {
         let mut url = start;
         for _ in 0..=MAX_REDIRECTS {
@@ -683,14 +681,14 @@ impl HostCrawl {
                 let Some(next) = location(&response, &url) else {
                     return Fetch::Skipped;
                 };
-                if filters::canonical_host_of(&next) != filters::canonical_host_of(&url) {
+                if !filters::same_site(&next, &url) {
                     // Another site: remember it for later instead of following it.
                     if next.path().ends_with('/') && next.query().is_none() {
-                        if self.trusted && top && self.moved_seeds < MAX_MOVED_SEEDS {
-                            // You added this site and it has moved: the new
-                            // address is yours too.
+                        if top && self.moved_seeds < MAX_MOVED_SEEDS {
+                            // You added this address and it has moved: the new one
+                            // is yours too (but cannot pass trust on again).
                             self.moved_seeds += 1;
-                            self.save_candidates_as(vec![next], store::SEED_SOURCE, false)
+                            self.save_candidates_as(vec![next], store::MOVED_SOURCE, false)
                                 .await;
                         } else {
                             self.save_candidates(vec![next]).await;
@@ -916,9 +914,12 @@ fn retry_after(response: &Response) -> Option<Duration> {
 /// True if a listing with exactly this content was already seen on the host.
 /// Names-only listings (no sizes or dates) can't be told apart, so they never count.
 fn is_duplicate(entries: &[Entry], seen: &mut HashSet<u64>) -> bool {
+    // Only a listing with files can be told apart from its siblings: folders that
+    // hold nothing but sub-folders, made together, list the same names and dates,
+    // and skipping them would lose what is below.
     if !entries
         .iter()
-        .any(|e| e.size.is_some() || e.mtime.is_some())
+        .any(|e| !e.is_dir && (e.size.is_some() || e.mtime.is_some()))
     {
         return false;
     }
@@ -994,17 +995,23 @@ mod tests {
     #[test]
     fn names_only_listings_are_never_duplicates() {
         let url = Url::parse("https://h.example/p1/src/").unwrap();
-        let entry = |size: Option<u64>| Entry {
+        let entry = |is_dir: bool, size: Option<u64>, mtime: Option<&str>| Entry {
             url: url.clone(),
             name: "src".into(),
-            is_dir: true,
+            is_dir,
             size,
-            mtime: None,
+            mtime: mtime.map(str::to_string),
         };
         let mut seen = HashSet::new();
-        assert!(!is_duplicate(&[entry(None)], &mut seen));
-        assert!(!is_duplicate(&[entry(None)], &mut seen));
-        assert!(!is_duplicate(&[entry(Some(1))], &mut seen));
-        assert!(is_duplicate(&[entry(Some(1))], &mut seen));
+        // Nothing to compare by: never a duplicate.
+        assert!(!is_duplicate(&[entry(false, None, None)], &mut seen));
+        assert!(!is_duplicate(&[entry(false, None, None)], &mut seen));
+        // Files with sizes: the same listing twice is a copy.
+        assert!(!is_duplicate(&[entry(false, Some(1), None)], &mut seen));
+        assert!(is_duplicate(&[entry(false, Some(1), None)], &mut seen));
+        // A listing of nothing but sub-folders is never a copy, even with dates.
+        let dated = [entry(true, None, Some("2026-09-28 10:15"))];
+        assert!(!is_duplicate(&dated, &mut seen));
+        assert!(!is_duplicate(&dated, &mut seen));
     }
 }

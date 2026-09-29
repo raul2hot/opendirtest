@@ -150,6 +150,39 @@ pub fn canonical_host_of(url: &Url) -> Option<String> {
     url.host_str().map(canonical_host)
 }
 
+/// True if both URLs are on the same site, however the host is spelled
+/// (`example.com` and `example.com.`).
+pub fn same_site(a: &Url, b: &Url) -> bool {
+    canonical_host_of(a) == canonical_host_of(b)
+}
+
+/// The URL with its host in canonical form, so one folder has one spelling and
+/// is stored, queued and crawled once.
+pub fn canonical_url(url: &Url) -> Url {
+    let mut url = url.clone();
+    if let Some(host) = url.host_str()
+        && host.ends_with('.')
+    {
+        let canonical = canonical_host(host);
+        // Fails only for a host that is nothing but dots; keep the URL as it was.
+        let _ = url.set_host(Some(&canonical));
+    }
+    url
+}
+
+/// How many folders deep a URL is: `https://h/a/b/` is 2. Works on the text of
+/// a URL, so the database can use it without parsing.
+pub fn path_depth(url: &str) -> usize {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = after_scheme.split_once('/').map_or("", |(_, path)| path);
+    path.split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
+}
+
 /// Turns an opt-out entry into a host name as crawled URLs have it: accepts a
 /// bare domain, a URL, `*.domain` and a trailing dot; lower-cases it and
 /// converts international names to their ASCII form.
@@ -316,7 +349,7 @@ fn is_user_hosted(host: &str) -> bool {
 /// True if the site's name (`ftp.example.org`, `dl.example.com`, `example.edu`)
 /// suggests a public file server or archive.
 pub fn has_archive_host(url: &Url) -> bool {
-    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let host = canonical_host_of(url).unwrap_or_default();
     !is_user_hosted(&host)
         && host
             .split(['.', '-'])
@@ -328,7 +361,7 @@ pub fn has_archive_host(url: &Url) -> bool {
 /// Discovery keeps only such listings, because most of the open directories a
 /// web crawl finds are website internals (upload folders, image folders).
 pub fn has_archive_signal(url: &Url) -> bool {
-    if is_user_hosted(&url.host_str().unwrap_or("").to_ascii_lowercase()) {
+    if is_user_hosted(&canonical_host_of(url).unwrap_or_default()) {
         return false;
     }
     has_archive_host(url)
@@ -412,6 +445,42 @@ mod tests {
         assert!(!is_likely_infringing("foo_1.0+repack.orig.tar.gz"));
         assert!(!is_likely_infringing("ssh-keygen.1.html"));
         assert!(!is_likely_infringing("lecture-01.mp4"));
+    }
+
+    #[test]
+    fn a_trailing_dot_is_the_same_site_everywhere() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        assert!(same_site(
+            &u("https://Example.org./a/"),
+            &u("https://example.org/b/")
+        ));
+        assert!(!same_site(
+            &u("https://example.org/"),
+            &u("https://example.com/")
+        ));
+        assert_eq!(
+            canonical_url(&u("https://Example.ORG./pub/x/?q=1")),
+            u("https://example.org/pub/x/?q=1")
+        );
+        assert_eq!(
+            canonical_url(&u("http://127.0.0.1:8080/a/")),
+            u("http://127.0.0.1:8080/a/")
+        );
+        // Opt-out entries and the user-hosted exclusion see through the dot.
+        let optout = vec!["example.org".to_string()];
+        assert!(host_opted_out("mirror.example.org.", &optout));
+        assert!(!has_archive_signal(&u("https://x.blogspot.com./pub/")));
+        assert!(has_archive_signal(&u("https://ftp.example.org./pub/")));
+    }
+
+    #[test]
+    fn folder_depth_of_a_url() {
+        assert_eq!(path_depth("https://h.example/"), 0);
+        assert_eq!(path_depth("https://h.example"), 0);
+        assert_eq!(path_depth("https://h.example/pub/"), 1);
+        assert_eq!(path_depth("https://h.example:8080/pub/iso/x/"), 3);
+        assert_eq!(path_depth("https://h.example/a//b/?x=/y/z"), 2);
+        assert_eq!(path_depth("https://h.example/a%2Fb/c/"), 2);
     }
 
     #[test]

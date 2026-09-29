@@ -516,9 +516,12 @@ Gbit/s.
 - Trust has two levels instead of the tiers in §6.1: sites you added (seeds) are
   trusted; everything else is untrusted and is dropped if it holds too little of value
   (`src/quality.rs`: 3 big files or 20 useful files, judged when the site is finished;
-  an unfinished site is dropped early only when plainly junk, counting only folders
-  without sub-folders, since an archive's top folders hold README files and its
-  downloads are further down). Sensitive names are strong (drop the site) or
+  an unfinished site is dropped early only when plainly junk, counting only leaf folders
+  (`dirs.leaf`, set by the crawler) and only once the leaves seen are as deep as the
+  deepest folder still waiting, since an archive's top folders hold README files and its
+  downloads are further down; a site that gave up or vanished is judged the same way over
+  all its files). Trust passes to the new address of a moved seed for one step only
+  (`candidates.source = 'moved'`). Sensitive names are strong (drop the site) or
   weak (drop an untrusted site, or just the entry on a trusted one), and include the
   signatures of a compromised server. `opendir clean` re-applies all rules to stored data.
 - Discovery keeps only listings with a sign of a public archive (host and path tokens,

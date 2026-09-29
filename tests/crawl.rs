@@ -60,8 +60,10 @@ async fn run(
     cfg: CrawlConfig,
     stop: CancellationToken,
 ) {
+    // The sites you name are recorded as seeds first, like the real command does.
+    let named = store::named_sites(&store::open(db).unwrap(), &seeds).unwrap();
     let (tx, writer) = store::spawn_writer(db.to_path_buf()).unwrap();
-    crawler::crawl(seeds, pending, cfg, tx, stop, Arc::new(Stats::default()))
+    crawler::crawl(named, pending, cfg, tx, stop, Arc::new(Stats::default()))
         .await
         .unwrap();
     writer.join().unwrap().unwrap();
@@ -1060,4 +1062,387 @@ async fn a_site_you_add_is_kept_even_if_discovery_found_it_first() {
     run_judged(vec![], &db).await;
 
     assert_eq!(host_status(&db, "127.0.0.2"), "done");
+}
+
+// -- Regression tests for the fourth independent review -----------------------
+
+fn host_trusted(db: &Path, host: &str) -> i64 {
+    query_one(
+        db,
+        &format!("SELECT coalesce((SELECT trusted FROM hosts WHERE host = '{host}'), -1)"),
+    )
+}
+
+fn clean_with_the_quality_check(db: &Path) -> store::CleanReport {
+    let mut conn = store::open(db).unwrap();
+    let rules = store::CleanRules {
+        optout: &[],
+        skip: &opendirtest::filters::SkipList::default(),
+        quality: Thresholds::default(),
+    };
+    store::clean(&mut conn, &rules).unwrap()
+}
+
+/// A site you added has a folder, `moved/`, that redirects to another site, which
+/// holds a tiny folder and would be dropped as junk unless someone vouched for it.
+/// With `pause_first` the crawl is split over two runs, so `moved/` is only reached
+/// in the second.
+async fn folder_that_redirects(db_name: &str, pause_first: bool) -> (String, i64) {
+    let target = serve(routes(vec![("/pub/", listing("/pub/", &[("a.txt", 5)]))])).await;
+    let to = format!("{}pub/", target.as_host("127.0.0.3"));
+    let mine = serve(routes(vec![
+        (
+            "/pub/",
+            listing("/pub/", &[("moved/", 0), ("a.iso", 4_000_000_000)]),
+        ),
+        ("/pub/moved/", Route::redirect(&to)),
+    ]))
+    .await;
+    let db = temp_db(db_name);
+    let seed = mine.as_host("127.0.0.2").join("pub/").unwrap();
+    if pause_first {
+        let one_folder = CrawlConfig {
+            max_dirs_per_host: 1,
+            quality: Thresholds::default(),
+            ..fast_config()
+        };
+        run_with_pending(vec![seed], &db, one_folder).await;
+        assert_eq!(host_status(&db, "127.0.0.2"), "paused");
+        run_judged(vec![], &db).await;
+    } else {
+        run_judged(vec![seed], &db).await;
+    }
+    (
+        query_one(
+            &db,
+            "SELECT coalesce((SELECT status FROM hosts WHERE host = '127.0.0.3'), '(none)')",
+        ),
+        host_trusted(&db, "127.0.0.3"),
+    )
+}
+
+#[tokio::test]
+async fn a_folder_of_your_site_that_redirects_elsewhere_gives_the_new_site_no_trust() {
+    // Reached in one run, or after a pause: the same outcome. Only an address you
+    // added yourself passes trust on when it has moved, not a folder inside a site.
+    for (name, pause_first) in [("leak-single", false), ("leak-resumed", true)] {
+        let (status, trusted) = folder_that_redirects(name, pause_first).await;
+        assert_eq!(status, "low_value", "{name}: trusted={trusted}");
+        assert_eq!(trusted, 0, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_waiting_folder_of_a_site_you_name_gives_no_trust_either() {
+    let target = serve(routes(vec![("/pub/", listing("/pub/", &[("a.txt", 5)]))])).await;
+    let to = format!("{}pub/", target.as_host("127.0.0.3"));
+    let mine = serve(routes(vec![
+        ("/pub/", listing("/pub/", &[("a.iso", 4_000_000_000)])),
+        ("/pub/moved/", Route::redirect(&to)),
+    ]))
+    .await;
+    let db = temp_db("named-waiting");
+    // A folder of the site found through a link earlier; you now crawl the site by
+    // name, which also crawls the folders it has waiting.
+    add_waiting(
+        &db,
+        &[mine.as_host("127.0.0.2").join("pub/moved/").unwrap()],
+    );
+
+    run_judged(vec![mine.as_host("127.0.0.2").join("pub/").unwrap()], &db).await;
+
+    assert_eq!(host_status(&db, "127.0.0.2"), "done");
+    assert_eq!(host_status(&db, "127.0.0.3"), "low_value");
+    assert_eq!(host_trusted(&db, "127.0.0.3"), 0);
+}
+
+#[tokio::test]
+async fn trust_does_not_travel_down_a_chain_of_moved_sites() {
+    // Your seed moved to B, and B redirects to C. C is not yours.
+    let c = serve(routes(vec![("/pub/", listing("/pub/", &[("a.txt", 5)]))])).await;
+    let to_c = format!("{}pub/", c.as_host("127.0.0.4"));
+    let b = serve(routes(vec![("/pub/", Route::redirect(&to_c))])).await;
+    let to_b = format!("{}pub/", b.as_host("127.0.0.3"));
+    let a = serve(routes(vec![("/pub/", Route::redirect(&to_b))])).await;
+    let db = temp_db("chain");
+
+    run_judged(vec![a.as_host("127.0.0.2").join("pub/").unwrap()], &db).await;
+
+    assert_eq!(
+        host_trusted(&db, "127.0.0.3"),
+        1,
+        "B is where your seed moved"
+    );
+    assert_eq!(
+        host_trusted(&db, "127.0.0.4"),
+        0,
+        "C is judged like any find"
+    );
+    assert_eq!(host_status(&db, "127.0.0.4"), "low_value");
+}
+
+#[tokio::test]
+async fn a_moved_seed_whose_new_address_was_already_found_is_kept_too() {
+    let target = serve(routes(vec![("/pub/", listing("/pub/", &[("a.txt", 5)]))])).await;
+    let to = format!("{}pub/", target.as_host("127.0.0.3"));
+    let old = serve(routes(vec![("/pub/", Route::redirect(&to))])).await;
+    let db = temp_db("moved-known");
+    // The new address was found through a link earlier and crawled while the
+    // quality check was off: kept, but not trusted.
+    add_waiting(&db, &[target.as_host("127.0.0.3").join("pub/").unwrap()]);
+    run_with_pending(vec![], &db, fast_config()).await;
+    assert_eq!(host_status(&db, "127.0.0.3"), "done");
+    assert_eq!(host_trusted(&db, "127.0.0.3"), 0);
+
+    // Now your seed, which has moved there, is crawled.
+    run_judged(vec![old.as_host("127.0.0.2").join("pub/").unwrap()], &db).await;
+
+    assert_eq!(host_trusted(&db, "127.0.0.3"), 1);
+    assert!(clean_with_the_quality_check(&db).low_value.is_empty());
+    assert_eq!(host_status(&db, "127.0.0.3"), "done");
+}
+
+/// `/pN/` holds README.txt, `docs/` (three small pages, a leaf) and `download/`,
+/// which holds `v1/` and, in there, the disk image.
+fn mirror_with_docs(projects: usize) -> HashMap<String, Route> {
+    let dirs: Vec<String> = (0..projects).map(|i| format!("p{i}/")).collect();
+    let root: Vec<(&str, u64)> = dirs.iter().map(|d| (d.as_str(), 0)).collect();
+    let mut site = vec![("/".to_string(), listing("/", &root))];
+    for i in 0..projects {
+        let readme = 900 + i as u64;
+        site.push((
+            format!("/p{i}/"),
+            listing(
+                &format!("/p{i}/"),
+                &[("README.txt", readme), ("docs/", 0), ("download/", 0)],
+            ),
+        ));
+        let index = 4_000 + i as u64;
+        site.push((
+            format!("/p{i}/docs/"),
+            listing(
+                &format!("/p{i}/docs/"),
+                &[
+                    ("index.html", index),
+                    ("intro.html", 6_000),
+                    ("faq.html", 7_000),
+                ],
+            ),
+        ));
+        site.push((
+            format!("/p{i}/download/"),
+            listing(&format!("/p{i}/download/"), &[("v1/", 0)]),
+        ));
+        let iso = format!("p{i}-1.0.iso");
+        site.push((
+            format!("/p{i}/download/v1/"),
+            listing(
+                &format!("/p{i}/download/v1/"),
+                &[(iso.as_str(), 4_000_000_000)],
+            ),
+        ));
+    }
+    site.into_iter().collect()
+}
+
+#[tokio::test]
+async fn small_pages_in_shallow_folders_do_not_hide_the_downloads_below() {
+    let server = serve(mirror_with_docs(110)).await;
+    let db = temp_db("docs");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+
+    run_judged(vec![], &db).await;
+
+    // 330 small pages sit in leaf folders one level above the disk images. The
+    // early check waits until the crawl has reached leaves as deep as what is
+    // still queued, and the folders that only hold `v1/` all list the same names
+    // and dates but are not copies of each other.
+    let why = reason(&db, "127.0.0.2");
+    assert_eq!(host_status(&db, "127.0.0.2"), "done", "{why}");
+    let images: i64 = query_one(&db, "SELECT count(*) FROM files WHERE url LIKE '%.iso'");
+    assert_eq!(images, 110);
+}
+
+#[tokio::test]
+async fn folders_that_only_hold_sub_folders_are_never_taken_for_copies() {
+    // Three projects made together: their `download/` folders list the same single
+    // sub-folder with the same date, and each `v1/` holds a different file.
+    let server = serve(routes(vec![
+        ("/", listing("/", &[("p0/", 0), ("p1/", 0), ("p2/", 0)])),
+        ("/p0/", listing("/p0/", &[("download/", 0)])),
+        ("/p1/", listing("/p1/", &[("download/", 0)])),
+        ("/p2/", listing("/p2/", &[("download/", 0)])),
+        ("/p0/download/", listing("/p0/download/", &[("v1/", 0)])),
+        ("/p1/download/", listing("/p1/download/", &[("v1/", 0)])),
+        ("/p2/download/", listing("/p2/download/", &[("v1/", 0)])),
+        (
+            "/p0/download/v1/",
+            listing("/p0/download/v1/", &[("zero.iso", 1_000)]),
+        ),
+        (
+            "/p1/download/v1/",
+            listing("/p1/download/v1/", &[("one.iso", 2_000)]),
+        ),
+        (
+            "/p2/download/v1/",
+            listing("/p2/download/v1/", &[("two.iso", 3_000)]),
+        ),
+    ]))
+    .await;
+    let db = temp_db("not-copies");
+
+    run_crawl(vec![server.base.clone()], &db, fast_config()).await;
+
+    for name in ["zero", "one", "two"] {
+        assert_eq!(
+            search(&db, name, true, vec![]).len(),
+            1,
+            "{name}.iso was never reached"
+        );
+    }
+}
+
+fn junk_folder_with_broken_sub_folders() -> HashMap<String, Route> {
+    let photos: Vec<(String, u64)> = (0..150)
+        .map(|i| (format!("photo-{i}.jpg"), 40_000))
+        .collect();
+    let mut root: Vec<(&str, u64)> = photos.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    // Six sub-folders that answer 500: five errors in a row make the crawl give up.
+    let subs: Vec<String> = (0..6).map(|i| format!("s{i}/")).collect();
+    root.extend(subs.iter().map(|s| (s.as_str(), 0)));
+    let mut site = vec![("/pub/".to_string(), listing("/pub/", &root))];
+    for i in 0..6 {
+        site.push((format!("/pub/s{i}/"), Route::text(500, "boom")));
+    }
+    site.into_iter().collect()
+}
+
+#[tokio::test]
+async fn junk_that_gave_up_after_errors_is_still_dropped() {
+    let server = serve(junk_folder_with_broken_sub_folders()).await;
+    let db = temp_db("gave-up");
+    add_waiting(&db, &[server.as_host("127.0.0.2").join("pub/").unwrap()]);
+
+    run_judged(vec![], &db).await;
+
+    // The site is never crawled again, so 150 photos must not stay searchable.
+    assert_eq!(host_status(&db, "127.0.0.2"), "low_value");
+    let files: i64 = query_one(&db, "SELECT count(*) FROM files WHERE is_dir = 0");
+    assert_eq!(files, 0);
+}
+
+#[tokio::test]
+async fn junk_stored_before_a_site_vanished_is_dropped() {
+    let server = serve(junk_folder_with_broken_sub_folders()).await;
+    let db = temp_db("vanished");
+    add_waiting(&db, &[server.as_host("127.0.0.2").join("pub/").unwrap()]);
+    // Run 1: a budget of one folder, so the site is paused with its photos stored
+    // and its sub-folders waiting one level deeper.
+    let one_folder = CrawlConfig {
+        max_dirs_per_host: 1,
+        quality: Thresholds::default(),
+        ..fast_config()
+    };
+    run_with_pending(vec![], &db, one_folder).await;
+    assert_eq!(host_status(&db, "127.0.0.2"), "paused");
+
+    // Run 2: every folder that is left answers with an error, and the site gives up.
+    run_judged(vec![], &db).await;
+
+    assert_eq!(host_status(&db, "127.0.0.2"), "low_value");
+}
+
+#[tokio::test]
+async fn junk_folders_with_skipped_sub_folders_are_dropped_early() {
+    let n = 300;
+    let dirs: Vec<String> = (0..n).map(|i| format!("p{i}/")).collect();
+    let root: Vec<(&str, u64)> = dirs.iter().map(|d| (d.as_str(), 0)).collect();
+    let mut site = vec![("/pub/".to_string(), listing("/pub/", &root))];
+    for i in 0..n {
+        site.push((
+            format!("/pub/p{i}/"),
+            listing(
+                &format!("/pub/p{i}/"),
+                &[
+                    ("a.jpg", 40_000),
+                    ("b.jpg", 41_000),
+                    ("c.jpg", 42_000),
+                    ("cache/", 0),
+                ],
+            ),
+        ));
+    }
+    let server = serve(site.into_iter().collect()).await;
+    let db = temp_db("skipped-below");
+    add_waiting(&db, &[server.as_host("127.0.0.2").join("pub/").unwrap()]);
+    // Each folder lists a `cache/` sub-folder that the skip list keeps the crawl out
+    // of, so nothing below the folders is ever visited: they are leaves.
+    let skip = opendirtest::filters::SkipList::from_lines(&["/cache/".to_string()]);
+    let cfg = CrawlConfig {
+        skip,
+        quality: Thresholds::default(),
+        ..fast_config()
+    };
+
+    run_with_pending(vec![], &db, cfg).await;
+
+    assert_eq!(host_status(&db, "127.0.0.2"), "low_value");
+    let requested = server.requested().len();
+    assert!(
+        requested < 150,
+        "the whole junk site was crawled ({requested} requests)"
+    );
+}
+
+fn caddy(entries: &[(&str, u64)]) -> Route {
+    let items: Vec<String> = entries
+        .iter()
+        .map(|(name, size)| {
+            let is_dir = name.ends_with('/');
+            format!(
+                "{{\"name\":\"{name}\",\"size\":{},\"url\":\"./{name}\",\
+                 \"mod_time\":\"2026-09-28T10:15:00Z\",\"mode\":420,\"is_dir\":{is_dir},\
+                 \"is_symlink\":false}}",
+                if is_dir { 4096 } else { *size }
+            )
+        })
+        .collect();
+    Route::new(
+        200,
+        Some("application/json"),
+        format!("[{}]", items.join(",")),
+    )
+}
+
+#[tokio::test]
+async fn a_caddy_archive_with_readmes_at_the_top_is_kept() {
+    let dirs: Vec<String> = (0..110).map(|i| format!("p{i}/")).collect();
+    let root: Vec<(&str, u64)> = dirs.iter().map(|d| (d.as_str(), 0)).collect();
+    let mut site = vec![("/".to_string(), caddy(&root))];
+    for i in 0..110 {
+        let readme = 900 + i as u64;
+        site.push((
+            format!("/p{i}/"),
+            caddy(&[
+                ("README.txt", readme),
+                ("index.html", 4_000),
+                ("releases/", 0),
+            ]),
+        ));
+        let iso = format!("p{i}-1.0.iso");
+        site.push((
+            format!("/p{i}/releases/"),
+            caddy(&[(iso.as_str(), 4_000_000_000)]),
+        ));
+    }
+    let server = serve(site.into_iter().collect()).await;
+    let db = temp_db("caddy-mirror");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+
+    run_judged(vec![], &db).await;
+
+    let why = reason(&db, "127.0.0.2");
+    assert_eq!(host_status(&db, "127.0.0.2"), "done", "{why}");
+    let images: i64 = query_one(&db, "SELECT count(*) FROM files WHERE url LIKE '%.iso'");
+    assert_eq!(images, 110);
 }

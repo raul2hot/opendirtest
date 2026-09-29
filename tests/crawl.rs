@@ -758,7 +758,7 @@ async fn a_new_site_full_of_junk_is_dropped_early_without_crawling_it_all() {
     assert_eq!(host_status(&db, "127.0.0.2"), "low_value");
     let requested = server.requested().len();
     assert!(
-        requested <= 105,
+        requested <= 115,
         "{requested} requests: should stop after ~100 folders"
     );
     let files: i64 = query_one(&db, "SELECT count(*) FROM entries");
@@ -1332,12 +1332,20 @@ async fn junk_that_gave_up_after_errors_is_still_dropped() {
 }
 
 #[tokio::test]
-async fn junk_stored_before_a_site_vanished_is_dropped() {
-    let server = serve(junk_folder_with_broken_sub_folders()).await;
-    let db = temp_db("vanished");
+async fn a_site_that_cannot_be_reached_in_a_later_run_stays_paused_with_its_frontier() {
+    // A paused archive: 120 README files at the top and `iso/` waiting below. In
+    // the next run `iso/` answers with a server error (down for the night, a
+    // hiccup). That must not end the site or throw away what it has stored.
+    let readmes: Vec<String> = (0..120).map(|i| format!("README-{i}.txt")).collect();
+    let mut top: Vec<(&str, u64)> = readmes.iter().map(|n| (n.as_str(), 900)).collect();
+    top.push(("iso/", 0));
+    let server = serve(routes(vec![
+        ("/pub/", listing("/pub/", &top)),
+        ("/pub/iso/", Route::text(500, "boom")),
+    ]))
+    .await;
+    let db = temp_db("hiccup");
     add_waiting(&db, &[server.as_host("127.0.0.2").join("pub/").unwrap()]);
-    // Run 1: a budget of one folder, so the site is paused with its photos stored
-    // and its sub-folders waiting one level deeper.
     let one_folder = CrawlConfig {
         max_dirs_per_host: 1,
         quality: Thresholds::default(),
@@ -1346,10 +1354,16 @@ async fn junk_stored_before_a_site_vanished_is_dropped() {
     run_with_pending(vec![], &db, one_folder).await;
     assert_eq!(host_status(&db, "127.0.0.2"), "paused");
 
-    // Run 2: every folder that is left answers with an error, and the site gives up.
     run_judged(vec![], &db).await;
 
-    assert_eq!(host_status(&db, "127.0.0.2"), "low_value");
+    let why = reason(&db, "127.0.0.2");
+    assert_eq!(host_status(&db, "127.0.0.2"), "paused", "{why}");
+    assert!(why.contains("will try again"), "{why}");
+    let stored: i64 = query_one(&db, "SELECT count(*) FROM files WHERE is_dir = 0");
+    assert_eq!(stored, 120);
+    // The folder is still waiting, so the next run tries it again.
+    let iso = server.as_host("127.0.0.2").join("pub/iso/").unwrap();
+    assert_eq!(pending_urls(&db), vec![iso.to_string()]);
 }
 
 #[tokio::test]
@@ -1387,9 +1401,11 @@ async fn junk_folders_with_skipped_sub_folders_are_dropped_early() {
     run_with_pending(vec![], &db, cfg).await;
 
     assert_eq!(host_status(&db, "127.0.0.2"), "low_value");
+    // Dropped once the folders looked at are as many as the ones still waiting:
+    // about half of the 300, not all of them.
     let requested = server.requested().len();
     assert!(
-        requested < 150,
+        requested < 200,
         "the whole junk site was crawled ({requested} requests)"
     );
 }
@@ -1445,4 +1461,358 @@ async fn a_caddy_archive_with_readmes_at_the_top_is_kept() {
     assert_eq!(host_status(&db, "127.0.0.2"), "done", "{why}");
     let images: i64 = query_one(&db, "SELECT count(*) FROM files WHERE url LIKE '%.iso'");
     assert_eq!(images, 110);
+}
+
+// -- Regression tests for the fifth independent review ------------------------
+
+/// `sections` junk sections, each with four leaf folders of 25 small images and a
+/// `deeper/` folder holding one more leaf, so the crawl always has something
+/// deeper waiting than the leaves it has seen.
+fn sectioned_junk(sections: usize) -> HashMap<String, Route> {
+    let names: Vec<String> = (0..sections).map(|i| format!("t{i}/")).collect();
+    let root: Vec<(&str, u64)> = names.iter().map(|d| (d.as_str(), 0)).collect();
+    let mut site = vec![("/".to_string(), listing("/", &root))];
+    let images = |seed: usize| -> Vec<(String, u64)> {
+        (0..25)
+            .map(|j| {
+                (
+                    format!("img-{j}.jpg"),
+                    30_000 + seed as u64 * 100 + j as u64,
+                )
+            })
+            .collect()
+    };
+    let mut leaf = |path: String, seed: usize| {
+        let files = images(seed);
+        let files: Vec<(&str, u64)> = files.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        site.push((path.clone(), listing(&path, &files)));
+    };
+    for i in 0..sections {
+        for k in 0..4 {
+            leaf(format!("/t{i}/s{k}/"), i * 4 + k);
+        }
+        leaf(format!("/t{i}/deeper/x0/"), 1_000 + i);
+    }
+    for i in 0..sections {
+        let mut items: Vec<(String, u64)> = (0..4).map(|k| (format!("s{k}/"), 0)).collect();
+        items.push(("deeper/".into(), 0));
+        let items: Vec<(&str, u64)> = items.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        site.push((format!("/t{i}/"), listing(&format!("/t{i}/"), &items)));
+        site.push((
+            format!("/t{i}/deeper/"),
+            listing(&format!("/t{i}/deeper/"), &[("x0/", 0)]),
+        ));
+    }
+    site.into_iter().collect()
+}
+
+#[tokio::test]
+async fn a_big_junk_site_is_dropped_on_overwhelming_evidence_whatever_waits() {
+    let server = serve(sectioned_junk(100)).await;
+    let db = temp_db("sectioned");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+
+    run_judged(vec![], &db).await;
+
+    // A folder deeper than the leaves is always waiting and far more folders wait
+    // than were looked at, so only overwhelming evidence can condemn the site:
+    // 2,000 images in leaf folders and nothing else. The site has 701 folders.
+    assert_eq!(host_status(&db, "127.0.0.2"), "low_value");
+    let requested = server.requested().len();
+    assert!(requested < 300, "{requested} requests");
+}
+
+/// 200 project folders: the even ones hold three images, the odd ones three images
+/// and an `iso/` folder with three disk images.
+fn wide_archive(n: usize) -> HashMap<String, Route> {
+    let dirs: Vec<String> = (0..n).map(|i| format!("p{i}/")).collect();
+    let root: Vec<(&str, u64)> = dirs.iter().map(|d| (d.as_str(), 0)).collect();
+    let mut site = vec![("/".to_string(), listing("/", &root))];
+    for i in 0..n {
+        let mut items: Vec<(&str, u64)> =
+            vec![("a.jpg", 40_000), ("b.jpg", 41_000), ("c.jpg", 42_000)];
+        if i % 2 == 1 {
+            items.push(("iso/", 0));
+        }
+        site.push((format!("/p{i}/"), listing(&format!("/p{i}/"), &items)));
+        if i % 2 == 1 {
+            let isos = [
+                ("x.iso", 4_000_000_000),
+                ("y.iso", 4_000_000_000),
+                ("z.iso", 4_000_000_000),
+            ];
+            site.push((
+                format!("/p{i}/iso/"),
+                listing(&format!("/p{i}/iso/"), &isos),
+            ));
+        }
+    }
+    site.into_iter().collect()
+}
+
+#[tokio::test]
+async fn folders_saved_past_the_budget_still_count_as_waiting() {
+    // The queue is full after the root, so every `iso/` folder is saved for the next
+    // run instead of being queued. The crawler must weigh them like the ones queued,
+    // as the cleanup does, or it drops an archive that `clean` would keep.
+    let server = serve(wide_archive(200)).await;
+    let db = temp_db("overflow");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+    let cfg = CrawlConfig {
+        max_dirs_per_host: 150,
+        quality: Thresholds::default(),
+        ..fast_config()
+    };
+
+    run_with_pending(vec![], &db, cfg).await;
+
+    let why = reason(&db, "127.0.0.2");
+    assert_eq!(host_status(&db, "127.0.0.2"), "paused", "{why}");
+    assert!(clean_with_the_quality_check(&db).low_value.is_empty());
+    assert_eq!(host_status(&db, "127.0.0.2"), "paused");
+}
+
+/// The listing of every path made of `a` and `b` up to `depth`: two sub-folders,
+/// like a site with two symlinks back to its root.
+fn looping_site(depth: usize) -> HashMap<String, Route> {
+    let mut site = HashMap::new();
+    let mut paths = vec![String::from("/")];
+    while let Some(path) = paths.pop() {
+        site.insert(path.clone(), listing(&path, &[("a/", 0), ("b/", 0)]));
+        if path.matches('/').count() <= depth {
+            paths.push(format!("{path}a/"));
+            paths.push(format!("{path}b/"));
+        }
+    }
+    site
+}
+
+#[tokio::test]
+async fn a_listing_that_repeats_at_every_level_is_walked_once() {
+    let server = serve(looping_site(6)).await;
+    let db = temp_db("loop");
+    let cfg = CrawlConfig {
+        max_dirs_per_host: 400,
+        ..fast_config()
+    };
+
+    run_crawl(vec![server.base.clone()], &db, cfg).await;
+
+    // `/a/` and `/b/` list exactly what `/` lists: copies of a parent, not walked.
+    let listings = server
+        .requested()
+        .iter()
+        .filter(|path| path.as_str() != "/robots.txt")
+        .count();
+    assert!(listings <= 5, "walked {listings} identical listings");
+}
+
+/// `projects` projects that each hold README.txt and `docs/` (three small pages);
+/// the ones from `docs_only` on also hold `download/v1/` with a disk image.
+fn mirror_docs_first(projects: usize, docs_only: usize) -> HashMap<String, Route> {
+    let dirs: Vec<String> = (0..projects).map(|i| format!("p{i}/")).collect();
+    let root: Vec<(&str, u64)> = dirs.iter().map(|d| (d.as_str(), 0)).collect();
+    let mut site = vec![("/".to_string(), listing("/", &root))];
+    for i in 0..projects {
+        let mut items: Vec<(&str, u64)> = vec![("README.txt", 900 + i as u64), ("docs/", 0)];
+        if i >= docs_only {
+            items.push(("download/", 0));
+        }
+        site.push((format!("/p{i}/"), listing(&format!("/p{i}/"), &items)));
+        let index = 4_000 + i as u64;
+        let pages = [
+            ("index.html", index),
+            ("intro.html", 6_000),
+            ("faq.html", 7_000),
+        ];
+        site.push((
+            format!("/p{i}/docs/"),
+            listing(&format!("/p{i}/docs/"), &pages),
+        ));
+        if i >= docs_only {
+            site.push((
+                format!("/p{i}/download/"),
+                listing(&format!("/p{i}/download/"), &[("v1/", 0)]),
+            ));
+            let iso = format!("p{i}-1.0.iso");
+            let files = [(iso.as_str(), 4_000_000_000)];
+            site.push((
+                format!("/p{i}/download/v1/"),
+                listing(&format!("/p{i}/download/v1/"), &files),
+            ));
+        }
+    }
+    site.into_iter().collect()
+}
+
+#[tokio::test]
+async fn an_archive_whose_first_projects_are_docs_only_is_kept() {
+    // Sixty of 110 projects hold only documentation, and come first. The leaf folders
+    // seen early are all small pages, and nothing deeper is queued yet, but there are
+    // more folders waiting than were looked at, and some of them lead to disk images.
+    let server = serve(mirror_docs_first(110, 60)).await;
+    let db = temp_db("docs-first");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+
+    run_judged(vec![], &db).await;
+
+    let why = reason(&db, "127.0.0.2");
+    assert_eq!(host_status(&db, "127.0.0.2"), "done", "{why}");
+    let images: i64 = query_one(&db, "SELECT count(*) FROM files WHERE url LIKE '%.iso'");
+    assert_eq!(images, 50);
+}
+
+#[tokio::test]
+async fn clean_keeps_the_same_archive_when_it_was_paused_among_the_docs() {
+    let server = serve(mirror_docs_first(110, 60)).await;
+    let db = temp_db("docs-first-paused");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+    // A budget that ends the run among the level-2 folders.
+    let cfg = CrawlConfig {
+        max_dirs_per_host: 160,
+        quality: Thresholds::OFF,
+        ..fast_config()
+    };
+    run_with_pending(vec![], &db, cfg).await;
+    assert_eq!(host_status(&db, "127.0.0.2"), "paused");
+
+    let report = clean_with_the_quality_check(&db);
+
+    assert!(report.low_value.is_empty(), "{:?}", report.low_value);
+    assert_eq!(host_status(&db, "127.0.0.2"), "paused");
+}
+
+#[tokio::test]
+async fn a_paused_crawl_of_the_new_address_of_a_moved_seed_keeps_its_trust() {
+    // Y was found through a link and is being crawled while your seed A turns out
+    // to have moved to Y. Y asks for a one second crawl delay, so A's redirect is
+    // recorded while Y's crawl is still running, and Y then runs out of budget.
+    let y = serve(routes(vec![
+        (
+            "/robots.txt",
+            Route::text(200, "User-agent: *\nCrawl-delay: 1\n"),
+        ),
+        ("/pub/", listing("/pub/", &[("later/", 0), ("a.txt", 5)])),
+        ("/pub/later/", listing("/pub/later/", &[("b.txt", 5)])),
+    ]))
+    .await;
+    let to = format!("{}pub/", y.as_host("127.0.0.3"));
+    let a = serve(routes(vec![("/pub/", Route::redirect(&to))])).await;
+    let db = temp_db("moved-paused");
+    add_waiting(&db, &[y.as_host("127.0.0.3").join("pub/").unwrap()]);
+    let cfg = CrawlConfig {
+        max_dirs_per_host: 1,
+        quality: Thresholds::default(),
+        ..fast_config()
+    };
+
+    run_with_pending(vec![a.as_host("127.0.0.2").join("pub/").unwrap()], &db, cfg).await;
+
+    assert_eq!(host_status(&db, "127.0.0.3"), "paused");
+    assert_eq!(
+        host_trusted(&db, "127.0.0.3"),
+        1,
+        "Y is where a seed of yours moved to"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crawl_by_name_on_the_command_line_keeps_a_tiny_site() {
+    // The real command: a site you name is recorded as yours before anything is
+    // judged, so thirty small images are kept, and it is crawled at all.
+    let photos: Vec<(String, u64)> = (0..30)
+        .map(|i| (format!("photo-{i}.jpg"), 40_000 + i as u64))
+        .collect();
+    let photos: Vec<(&str, u64)> = photos.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    let server = serve(routes(vec![("/", listing("/", &photos))])).await;
+    let db = temp_db("cli-named");
+    let url = server.base.to_string();
+    let program = env!("CARGO_BIN_EXE_opendir");
+    let db_arg = db.to_str().unwrap().to_string();
+
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(program)
+            .args(["crawl", &url, "--max-dirs", "5", "--db", &db_arg])
+            .current_dir(std::env::temp_dir())
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{log}");
+    assert_eq!(host_status(&db, "127.0.0.1"), "done", "{log}");
+    assert_eq!(host_trusted(&db, "127.0.0.1"), 1);
+    let stored: i64 = query_one(&db, "SELECT count(*) FROM files WHERE is_dir = 0");
+    assert_eq!(stored, 30);
+}
+
+#[tokio::test]
+async fn a_finished_site_that_fails_when_crawled_again_by_name_is_not_left_paused() {
+    // The same site name on two ports: first answering, then only with errors.
+    let good = serve(routes(vec![(
+        "/pub/",
+        listing("/pub/", &[("a.iso", 4_000_000_000)]),
+    )]))
+    .await;
+    let broken = serve(routes(vec![("/pub/", Route::text(500, "boom"))])).await;
+    let db = temp_db("done-then-fails");
+    run_crawl(
+        vec![good.as_host("127.0.0.2").join("pub/").unwrap()],
+        &db,
+        fast_config(),
+    )
+    .await;
+    assert_eq!(host_status(&db, "127.0.0.2"), "done");
+
+    run_crawl(
+        vec![broken.as_host("127.0.0.2").join("pub/").unwrap()],
+        &db,
+        fast_config(),
+    )
+    .await;
+
+    // Only a site that was paused, with folders saved to continue from, stays
+    // paused after a run that could not reach it. A finished one has nothing to
+    // resume, so "paused" would be a dead end.
+    assert_eq!(host_status(&db, "127.0.0.2"), "unreachable");
+    assert!(pending_urls(&db).is_empty());
+}
+
+#[tokio::test]
+async fn folders_saved_past_the_budget_weigh_as_much_as_the_queued_ones() {
+    // 300 folders side by side: the first 200 hold three small images, the last 100
+    // hold a disk image. With a budget of 150 the queue fills up after the root, so
+    // all the disk image folders are saved for the next run. The junk seen first is
+    // 100 leaf folders at the same depth as those, and 100 saved folders is not a
+    // sample that says anything about the rest.
+    let names: Vec<String> = (0..300).map(|i| format!("p{i}/")).collect();
+    let root: Vec<(&str, u64)> = names.iter().map(|d| (d.as_str(), 0)).collect();
+    let mut site = vec![("/".to_string(), listing("/", &root))];
+    for i in 0..300 {
+        let files: Vec<(String, u64)> = if i < 200 {
+            (0..3)
+                .map(|j| (format!("img-{j}.jpg"), 30_000 + i as u64 * 10 + j))
+                .collect()
+        } else {
+            vec![(format!("p{i}.iso"), 4_000_000_000)]
+        };
+        let files: Vec<(&str, u64)> = files.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        site.push((format!("/p{i}/"), listing(&format!("/p{i}/"), &files)));
+    }
+    let server = serve(site.into_iter().collect()).await;
+    let db = temp_db("overflow-count");
+    add_waiting(&db, &[server.as_host("127.0.0.2")]);
+    let cfg = CrawlConfig {
+        max_dirs_per_host: 150,
+        quality: Thresholds::default(),
+        ..fast_config()
+    };
+
+    run_with_pending(vec![], &db, cfg).await;
+
+    let why = reason(&db, "127.0.0.2");
+    assert_eq!(host_status(&db, "127.0.0.2"), "paused", "{why}");
+    assert!(clean_with_the_quality_check(&db).low_value.is_empty());
 }

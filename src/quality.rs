@@ -14,12 +14,21 @@ pub const BIG_FILE: u64 = 10 * 1024 * 1024;
 /// finish, once it has been crawled for this many folders...
 pub const PROBE_DIRS: u64 = 100;
 
-/// ...and only if at least this many files have been seen in folders that hold
-/// no sub-folders. A big archive's top folders hold README and index files, and
-/// the disk images are further down, so a crawl that is still near the top
-/// says nothing yet. Files in folders that do have sub-folders are not counted
-/// for an unfinished site.
+/// ...and only if at least this many files have been seen in leaf folders (folders
+/// with nothing below them to crawl). A big archive's top folders hold README and
+/// index files, and the disk images are further down, so a crawl that is still
+/// near the top says nothing yet. Files in folders that do have sub-folders are not
+/// counted for a site that is still being crawled.
 pub const MIN_EVIDENCE: u64 = 100;
+
+/// A verdict on a site still being crawled needs leaf folders from at least this
+/// many different places, so that the first few folders cannot decide.
+pub const MIN_SAMPLE_FOLDERS: u64 = 20;
+
+/// This many files in leaf folders, none big and none useful, is junk whatever is
+/// left to crawl. It bounds what a big junk site can cost: below it, a sample that
+/// the rest of the site could contradict decides nothing.
+pub const HARD_EVIDENCE: u64 = 2_000;
 
 /// Extensions (lower case, without the dot) of files people go looking for.
 /// Web page assets (html, php, js, css, jpg, png, gif, ...) are left out on
@@ -102,6 +111,46 @@ impl Default for Thresholds {
     }
 }
 
+/// How far the files counted for a site can be trusted to speak for all of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sample {
+    /// Everything the site has, at the end of a crawl that finished.
+    Final,
+    /// What is known of a site that will not be crawled again (it gave up, or is
+    /// gone), or a sample of one still being crawled that is as large as what is
+    /// left and reaches as deep: dropped only when plainly junk.
+    Representative,
+    /// A sample of a site still being crawled that what is left could contradict:
+    /// only overwhelming evidence counts.
+    Partial,
+}
+
+/// How much to trust the leaf folders seen so far on a site that is still being
+/// crawled, given the folders still waiting. `None` if there are too few to say
+/// anything. The crawler (in memory) and the database (after a run) both ask
+/// this, so they agree.
+///
+/// The sample must have leaves as deep as the deepest folder still waiting (small
+/// pages in shallow folders say nothing about downloads deeper down), and be at
+/// least as large as what waits (siblings not looked at yet can differ).
+pub fn sample(
+    leaf_folders: u64,
+    deepest_leaf: Option<usize>,
+    waiting: u64,
+    deepest_waiting: Option<usize>,
+) -> Option<Sample> {
+    let deepest_leaf = deepest_leaf?;
+    if leaf_folders < MIN_SAMPLE_FOLDERS {
+        return None;
+    }
+    let reaches_as_deep = deepest_waiting.is_none_or(|waiting| waiting <= deepest_leaf);
+    Some(if reaches_as_deep && waiting <= leaf_folders {
+        Sample::Representative
+    } else {
+        Sample::Partial
+    })
+}
+
 impl Thresholds {
     /// Keep every site.
     pub const OFF: Thresholds = Thresholds {
@@ -115,24 +164,29 @@ impl Thresholds {
 
     /// `Some(reason)` if the site holds too little to be kept.
     ///
-    /// A finished site is judged by the thresholds. A site that is not finished
-    /// is only dropped when what it holds so far is plainly junk: at least
-    /// `MIN_EVIDENCE` files (counted in folders without sub-folders), nothing
-    /// big, and under 5% useful files. Closer to the thresholds it may still
-    /// get there, so it is left for the verdict at the end.
-    pub fn judge(&self, counts: &Counts, finished: bool) -> Option<String> {
-        if !finished
-            && (counts.files < MIN_EVIDENCE || counts.big > 0 || counts.useful * 20 >= counts.files)
-        {
-            return None;
-        }
+    /// A finished site is judged by the thresholds. Anything else is only dropped
+    /// when what it holds is plainly junk: nothing big, and either under 5% useful
+    /// files among at least `MIN_EVIDENCE` (if the sample is representative), or no
+    /// useful file at all among `HARD_EVIDENCE`. Closer to the thresholds it may
+    /// still get there, so it is left for the verdict at the end.
+    pub fn judge(&self, counts: &Counts, sample: Sample) -> Option<String> {
         if counts.big >= self.min_big || counts.useful >= self.min_useful {
             return None;
         }
-        Some(format!(
-            "nothing worth keeping: {} big files (need {}) and {} useful files (need {}) among {} files",
-            counts.big, self.min_big, counts.useful, self.min_useful, counts.files
-        ))
+        let overwhelming = counts.files >= HARD_EVIDENCE && counts.big == 0 && counts.useful == 0;
+        let plainly_junk =
+            counts.files >= MIN_EVIDENCE && counts.big == 0 && counts.useful * 20 < counts.files;
+        let junk = match sample {
+            Sample::Final => true,
+            Sample::Representative => plainly_junk || overwhelming,
+            Sample::Partial => overwhelming,
+        };
+        junk.then(|| {
+            format!(
+                "nothing worth keeping: {} big files (need {}) and {} useful files (need {}) among {} files",
+                counts.big, self.min_big, counts.useful, self.min_useful, counts.files
+            )
+        })
     }
 }
 
@@ -178,23 +232,23 @@ mod tests {
             site.add(&format!("photo-{i}.jpg"), Some(2_000_000));
         }
         site.add("index.php", Some(28));
-        assert!(t.judge(&site, true).is_some());
+        assert!(t.judge(&site, Sample::Final).is_some());
 
         // A few big files: a small software archive.
         let mut isos = Counts::default();
         for v in ["a", "b", "c"] {
             isos.add(&format!("{v}.iso"), Some(4_000_000_000));
         }
-        assert_eq!(t.judge(&isos, true), None);
+        assert_eq!(t.judge(&isos, Sample::Final), None);
 
         // Many documents, none big: a paper archive.
         let mut papers = Counts::default();
         for i in 0..20 {
             papers.add(&format!("paper-{i}.pdf"), Some(400_000));
         }
-        assert_eq!(t.judge(&papers, true), None);
+        assert_eq!(t.judge(&papers, Sample::Final), None);
         papers.useful = 19;
-        assert!(t.judge(&papers, true).is_some());
+        assert!(t.judge(&papers, Sample::Final).is_some());
 
         // An unfinished site with few files so far is not judged yet: its top
         // folders may simply not hold any files.
@@ -203,32 +257,87 @@ mod tests {
             big: 0,
             useful: 0,
         };
-        assert_eq!(t.judge(&few, false), None);
-        assert!(t.judge(&few, true).is_some());
+        assert_eq!(t.judge(&few, Sample::Representative), None);
+        assert!(t.judge(&few, Sample::Final).is_some());
         // Plainly junk so far: plenty of files, nothing big, almost nothing useful.
         let many = Counts { files: 400, ..few };
-        assert!(t.judge(&many, false).is_some());
+        assert!(t.judge(&many, Sample::Representative).is_some());
         // Not plainly junk: any big file, or a fair share of useful ones, waits
         // for the verdict at the end, even if it is under the absolute thresholds.
         let one_big = Counts { big: 1, ..many };
-        assert_eq!(t.judge(&one_big, false), None);
+        assert_eq!(t.judge(&one_big, Sample::Representative), None);
         let some_useful = Counts {
             files: 300,
             big: 0,
             useful: 19,
         };
-        assert_eq!(t.judge(&some_useful, false), None);
-        assert!(t.judge(&some_useful, true).is_some());
+        assert_eq!(t.judge(&some_useful, Sample::Representative), None);
+        assert!(t.judge(&some_useful, Sample::Final).is_some());
         // Under 5% useful is plainly junk even when a few files are useful.
         let few_useful = Counts {
             files: 400,
             big: 0,
             useful: 19,
         };
-        assert!(t.judge(&few_useful, false).is_some());
+        assert!(t.judge(&few_useful, Sample::Representative).is_some());
 
         // Turned off: everything is kept.
         assert!(!Thresholds::OFF.enabled());
-        assert_eq!(Thresholds::OFF.judge(&Counts::default(), true), None);
+        assert_eq!(
+            Thresholds::OFF.judge(&Counts::default(), Sample::Final),
+            None
+        );
+    }
+
+    #[test]
+    fn a_partial_sample_only_condemns_overwhelming_junk() {
+        let t = Thresholds::default();
+        // Plainly junk, but only a part of a site that has more to show.
+        let plain = Counts {
+            files: 400,
+            big: 0,
+            useful: 0,
+        };
+        assert!(t.judge(&plain, Sample::Representative).is_some());
+        assert_eq!(t.judge(&plain, Sample::Partial), None);
+        // Thousands of files, nothing big and nothing useful: junk whatever is left.
+        let overwhelming = Counts {
+            files: HARD_EVIDENCE,
+            big: 0,
+            useful: 0,
+        };
+        assert!(t.judge(&overwhelming, Sample::Partial).is_some());
+        // One useful file among them, or one big one, and it waits for the end.
+        let one_useful = Counts {
+            useful: 1,
+            ..overwhelming
+        };
+        assert_eq!(t.judge(&one_useful, Sample::Partial), None);
+        let one_big = Counts {
+            big: 1,
+            ..overwhelming
+        };
+        assert_eq!(t.judge(&one_big, Sample::Partial), None);
+        assert_eq!(t.judge(&one_big, Sample::Representative), None);
+        // Turned off: kept whatever the sample says.
+        assert_eq!(Thresholds::OFF.judge(&overwhelming, Sample::Partial), None);
+    }
+
+    #[test]
+    fn a_sample_is_representative_when_it_is_as_big_and_as_deep_as_what_waits() {
+        use Sample::{Partial, Representative};
+        // Too few leaf folders, or none: nothing to say.
+        assert_eq!(sample(MIN_SAMPLE_FOLDERS - 1, Some(2), 0, None), None);
+        assert_eq!(sample(0, None, 5, Some(1)), None);
+        assert_eq!(sample(50, None, 5, Some(1)), None);
+        // Nothing waits: the sample is all there is.
+        assert_eq!(sample(30, Some(2), 0, None), Some(Representative));
+        // Waiting folders no deeper than the deepest leaf, and no more of them.
+        assert_eq!(sample(30, Some(2), 30, Some(2)), Some(Representative));
+        assert_eq!(sample(30, Some(3), 10, Some(1)), Some(Representative));
+        // More waiting than sampled: siblings not seen yet may differ.
+        assert_eq!(sample(30, Some(2), 31, Some(2)), Some(Partial));
+        // A waiting folder deeper than every leaf seen.
+        assert_eq!(sample(300, Some(2), 1, Some(3)), Some(Partial));
     }
 }

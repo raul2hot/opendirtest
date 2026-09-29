@@ -53,6 +53,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_CRAWL_DELAY: Duration = Duration::from_secs(60);
 /// Directories past the per-run budget saved for the next run, at most (per host).
 const MAX_SAVED_OVERFLOW: usize = 50_000;
+/// The early check of a new site is made at every this many folders.
+const PROBE_EVERY: u64 = 8;
 /// How often the scheduler looks for newly found sites while slots are free.
 const POLL_EVERY: Duration = Duration::from_secs(2);
 /// A site you added that has moved to another host passes its trust on to the
@@ -422,7 +424,7 @@ impl HostCrawl {
         }
         let mut queue: VecDeque<(Url, usize)> = seeds.into_iter().map(|u| (u, 0)).collect();
         let mut seen: HashSet<String> = queue.iter().map(|(u, _)| u.to_string()).collect();
-        let mut listing_hashes = HashSet::new();
+        let mut listings = Listings::default();
         let mut server = None;
         let mut dirs = 0u64;
         let mut stopped = false;
@@ -433,9 +435,11 @@ impl HostCrawl {
         // A new site you did not add is judged early, so junk does not hold a
         // crawl slot: after PROBE_DIRS folders, by what its files look like.
         let mut counts = Counts::default();
-        // How deep the leaf folders counted so far are.
-        let mut deepest_leaf = 0;
-        let mut probed = false;
+        // The leaf folders counted so far, and how deep the deepest is.
+        let mut leaf_folders = 0u64;
+        let mut deepest_leaf: Option<usize> = None;
+        // How deep the deepest folder saved past this run's budget is.
+        let mut overflow_deepest: Option<usize> = None;
         let early_judge = (!self.trusted && self.first_run && self.cfg.quality.enabled())
             .then_some(self.cfg.quality);
 
@@ -529,7 +533,7 @@ impl HostCrawl {
 
             // Content already seen on this host (a symlink loop or an alias such
             // as `latest -> 2.4.1`): keep the entries, but don't walk it again.
-            if !is_duplicate(&entries, &mut listing_hashes) {
+            if !listings.is_copy(&page_url, &entries) {
                 // Past this run's budget, directories go to the database for the
                 // next run instead of into memory.
                 let mut overflow = Vec::new();
@@ -539,6 +543,8 @@ impl HostCrawl {
                             queue.push_back((dir, depth + 1));
                         } else if overflow_saved < MAX_SAVED_OVERFLOW {
                             overflow_saved += 1;
+                            overflow_deepest =
+                                overflow_deepest.max(Some(filters::path_depth(dir.as_str())));
                             overflow.push(dir);
                         }
                     }
@@ -554,25 +560,36 @@ impl HostCrawl {
             }
 
             // A new site you did not add is judged early, on what its leaf folders
-            // hold: the top of a big archive is README and index files, and its
-            // downloads are further down. So the verdict waits until the leaves
-            // seen are as deep as anything still queued.
-            if leaf {
+            // hold, and only as far as `quality::sample` trusts them against what
+            // still waits: the top of a big archive is README and index files, and
+            // its downloads are further down. Empty folders leave nothing stored,
+            // so they do not count.
+            if leaf && !entries.is_empty() {
                 for e in entries.iter().filter(|e| !e.is_dir) {
                     counts.add(&e.name, e.size);
                 }
-                deepest_leaf = deepest_leaf.max(filters::path_depth(page_url.as_str()));
+                leaf_folders += 1;
+                deepest_leaf = deepest_leaf.max(Some(filters::path_depth(page_url.as_str())));
             }
-            if dirs >= quality::PROBE_DIRS
-                && !probed
+            // Looking at the queue costs a little, so only when the counts could
+            // condemn the site, and not at every folder.
+            if let Some(thresholds) = early_judge
+                && dirs >= quality::PROBE_DIRS
+                && dirs.is_multiple_of(PROBE_EVERY)
                 && counts.files >= quality::MIN_EVIDENCE
-                && let Some(thresholds) = early_judge
-                && queue
-                    .iter()
-                    .all(|(u, _)| filters::path_depth(u.as_str()) <= deepest_leaf)
+                && counts.big == 0
+                && counts.useful * 20 < counts.files
             {
-                probed = true; // one early verdict; the writer judges again at the end
-                if let Some(why) = thresholds.judge(&counts, false) {
+                let deepest_waiting = queue
+                    .iter()
+                    .map(|(u, _)| filters::path_depth(u.as_str()))
+                    .max()
+                    .max(overflow_deepest);
+                let waiting = queue.len() as u64 + overflow_saved as u64;
+                if let Some(sample) =
+                    quality::sample(leaf_folders, deepest_leaf, waiting, deepest_waiting)
+                    && let Some(why) = thresholds.judge(&counts, sample)
+                {
                     return Some(Report {
                         status: HostStatus::LowValue,
                         server,
@@ -604,6 +621,20 @@ impl HostCrawl {
         let (status, reason) = match dirs {
             0 if self.robots_blocked.is_some() => {
                 (HostStatus::RobotsDisallowed, self.robots_blocked.take())
+            }
+            0 if self.last_error.is_some() && !self.first_run => {
+                // A site continued from an earlier run that could not be reached this
+                // time (down for the night, a server error on its last folders): keep
+                // it paused with what was waiting and try again, instead of ending it.
+                let error = self.last_error.take().unwrap_or_default();
+                let msg = Msg::Paused {
+                    host: self.host.clone(),
+                    finished: Vec::new(),
+                    frontier: started_from,
+                };
+                let _ = self.tx.send(msg).await;
+                let why = format!("could not be reached this run ({error}); will try again");
+                (HostStatus::Paused, Some(why))
             }
             0 if self.last_error.is_some() => (HostStatus::Unreachable, self.last_error.take()),
             0 => (HostStatus::NotListing, None),
@@ -696,7 +727,8 @@ impl HostCrawl {
                     }
                     return Fetch::Skipped;
                 }
-                url = next;
+                // One spelling per folder (`host.` is `host`), as stored and queued.
+                url = filters::canonical_url(&next);
                 continue;
             }
             if status.is_server_error() {
@@ -911,27 +943,51 @@ fn retry_after(response: &Response) -> Option<Duration> {
     value.trim().parse().ok().map(Duration::from_secs)
 }
 
-/// True if a listing with exactly this content was already seen on the host.
-/// Names-only listings (no sizes or dates) can't be told apart, so they never count.
-fn is_duplicate(entries: &[Entry], seen: &mut HashSet<u64>) -> bool {
-    // Only a listing with files can be told apart from its siblings: folders that
-    // hold nothing but sub-folders, made together, list the same names and dates,
-    // and skipping them would lose what is below.
-    if !entries
-        .iter()
-        .any(|e| !e.is_dir && (e.size.is_some() || e.mtime.is_some()))
-    {
-        return false;
-    }
-    let mut hasher = DefaultHasher::new();
-    for e in entries {
-        (&e.name, e.is_dir, e.size, &e.mtime).hash(&mut hasher);
-    }
-    !seen.insert(hasher.finish())
+/// The listings seen on one host, to spot copies: an alias such as
+/// `latest -> 2.4.1`, or a symlink back to a parent.
+#[derive(Default)]
+struct Listings {
+    /// Listings that hold files, by content.
+    with_files: HashSet<u64>,
+    /// Listings that hold nothing but sub-folders, by content, with the addresses
+    /// they were seen at.
+    folders_only: HashMap<u64, Vec<String>>,
 }
 
-/// True if the path ends with the same run of segments three times in a row,
-/// like `/a/b/a/b/a/b/`: a loop the listing hash did not catch.
+impl Listings {
+    /// True if `entries`, the listing of `url`, is a copy of one seen before, so
+    /// that its sub-folders need not be walked again.
+    ///
+    /// A listing with files is a copy of any earlier one with the same content.
+    /// Folders that hold only sub-folders and were made together list the same
+    /// names and dates, and skipping them would lose what is below, so such a
+    /// listing is a copy only of one seen at a parent (a loop). Listings with
+    /// neither sizes nor dates cannot be compared and are never copies.
+    fn is_copy(&mut self, url: &Url, entries: &[Entry]) -> bool {
+        if !entries
+            .iter()
+            .any(|e| e.size.is_some() || e.mtime.is_some())
+        {
+            return false;
+        }
+        let mut hasher = DefaultHasher::new();
+        for e in entries {
+            (&e.name, e.is_dir, e.size, &e.mtime).hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        if entries.iter().any(|e| !e.is_dir) {
+            return !self.with_files.insert(key);
+        }
+        let here = url.as_str();
+        let earlier = self.folders_only.entry(key).or_default();
+        let looped = earlier
+            .iter()
+            .any(|parent| here.starts_with(parent.as_str()));
+        earlier.push(here.to_string());
+        looped
+    }
+}
+
 fn has_repeating_segments(path: &str) -> bool {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let n = segments.len();
@@ -993,25 +1049,29 @@ mod tests {
     }
 
     #[test]
-    fn names_only_listings_are_never_duplicates() {
-        let url = Url::parse("https://h.example/p1/src/").unwrap();
+    fn copies_of_listings_are_spotted_without_losing_folders_made_together() {
         let entry = |is_dir: bool, size: Option<u64>, mtime: Option<&str>| Entry {
-            url: url.clone(),
+            url: Url::parse("https://h.example/p1/src/").unwrap(),
             name: "src".into(),
             is_dir,
             size,
             mtime: mtime.map(str::to_string),
         };
-        let mut seen = HashSet::new();
-        // Nothing to compare by: never a duplicate.
-        assert!(!is_duplicate(&[entry(false, None, None)], &mut seen));
-        assert!(!is_duplicate(&[entry(false, None, None)], &mut seen));
-        // Files with sizes: the same listing twice is a copy.
-        assert!(!is_duplicate(&[entry(false, Some(1), None)], &mut seen));
-        assert!(is_duplicate(&[entry(false, Some(1), None)], &mut seen));
-        // A listing of nothing but sub-folders is never a copy, even with dates.
+        let at = |path: &str| Url::parse(&format!("https://h.example{path}")).unwrap();
+        let mut seen = Listings::default();
+        // Nothing to compare by: never a copy.
+        assert!(!seen.is_copy(&at("/a/"), &[entry(false, None, None)]));
+        assert!(!seen.is_copy(&at("/b/"), &[entry(false, None, None)]));
+        // Files with sizes: the same listing twice, anywhere, is a copy.
+        assert!(!seen.is_copy(&at("/c/"), &[entry(false, Some(1), None)]));
+        assert!(seen.is_copy(&at("/d/"), &[entry(false, Some(1), None)]));
+        // A listing of nothing but sub-folders is not a copy of a sibling: folders
+        // made together list the same names and dates.
         let dated = [entry(true, None, Some("2026-09-28 10:15"))];
-        assert!(!is_duplicate(&dated, &mut seen));
-        assert!(!is_duplicate(&dated, &mut seen));
+        assert!(!seen.is_copy(&at("/x/p0/download/"), &dated));
+        assert!(!seen.is_copy(&at("/x/p1/download/"), &dated));
+        // ...but it is a copy of one of its own parents: a loop.
+        assert!(seen.is_copy(&at("/x/p1/download/loop/"), &dated));
+        assert!(seen.is_copy(&at("/x/p0/download/a/b/"), &dated));
     }
 }

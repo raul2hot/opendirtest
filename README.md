@@ -113,12 +113,20 @@ readme).
 
 The check is careful with sites that are not finished. A big archive's top folders hold
 README and index files, and its downloads are further down. So a site that is still being
-crawled is judged only on its leaf folders (folders with nothing below them to crawl), and
-only once the crawl has reached leaves as deep as the deepest folder still waiting. It is
-dropped only when that is plainly junk: at least 100 such files, none of them big, and
-under 5% of a useful kind. Anything closer to the line waits for the verdict when the site
-is finished. A site that gave up after errors, or vanished, will not be crawled again, so
-what it holds is final: it is dropped when plainly junk, counting every file.
+crawled is judged only on its leaf folders (folders with nothing below them to crawl), from
+at least 20 different folders, and only when that sample is a fair one: its leaves are as
+deep as the deepest folder still waiting, and there are at least as many of them as folders
+waiting (siblings not looked at yet can differ). Then it is dropped only when plainly junk:
+at least 100 such files, none of them big, and under 5% of a useful kind. Anything closer to
+the line waits for the verdict when the site is finished. A site so big that it never gets
+a fair sample is still dropped on overwhelming evidence, 2,000 files in leaf folders with
+nothing big and nothing useful among them, which also bounds what junk can cost.
+
+A site that gave up after errors, or is not a listing any more, will not be crawled again,
+so what it holds is final: it is dropped when plainly junk, counting every file. A site that
+was paused and cannot be reached in a later run (down for the night, a server error on its
+last folders) is not ended: it stays paused with the folders it had waiting, and is tried
+again the next night.
 Change the limits with `--min-big`, `--min-useful`, or `--keep-all`.
 
 Sites are also dropped when a listing looks like an accidental exposure or a broken-into
@@ -292,7 +300,9 @@ or deletion requests, open an issue with the URLs; they go into
 - Common Crawl discovery recognises Apache and nginx-fancyindex listings (they have sort
   links). Plain nginx listings are found only through seeds and links.
 - Sites that were unreachable or not a listing are retried only if they are in your
-  seeds. Use `forget` to retry any other one.
+  seeds. Use `forget` to retry any other one. A site that was paused earlier and stays
+  unreachable is tried once a night for ever, which costs a request or two; `forget` it to
+  stop.
 - Finished sites are not re-crawled automatically yet. To refresh one, `forget` it and
   keep it in your seeds.
 - Dates are stored as the server shows them, with no time zone.

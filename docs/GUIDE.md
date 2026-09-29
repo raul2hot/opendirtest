@@ -517,11 +517,14 @@ Gbit/s.
   trusted; everything else is untrusted and is dropped if it holds too little of value
   (`src/quality.rs`: 3 big files or 20 useful files, judged when the site is finished;
   an unfinished site is dropped early only when plainly junk, counting only leaf folders
-  (`dirs.leaf`, set by the crawler) and only once the leaves seen are as deep as the
-  deepest folder still waiting, since an archive's top folders hold README files and its
-  downloads are further down; a site that gave up or vanished is judged the same way over
-  all its files). Trust passes to the new address of a moved seed for one step only
-  (`candidates.source = 'moved'`). Sensitive names are strong (drop the site) or
+  (`dirs.leaf`, set by the crawler) from at least 20 places, and only when that sample is
+  fair (`quality::sample`: leaves as deep as, and at least as many as, the folders still
+  waiting), since an archive's top folders hold README files and its downloads are further
+  down; 2,000 leaf files with nothing big or useful are junk whatever waits, which bounds
+  the cost of a huge junk site; a site that gave up or vanished is judged over all its
+  files; a paused site that cannot be reached stays paused). Trust passes to the new
+  address of a moved seed for one step only (`candidates.source = 'moved'`), and a
+  redirect never clears a `sensitive` verdict. Sensitive names are strong (drop the site) or
   weak (drop an untrusted site, or just the entry on a trusted one), and include the
   signatures of a compromised server. `opendir clean` re-applies all rules to stored data.
 - Discovery keeps only listings with a sign of a public archive (host and path tokens,
